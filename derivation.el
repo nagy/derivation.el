@@ -16,87 +16,109 @@
 ;; License along with this file.  If not, see
 ;; <https://www.gnu.org/licenses/>.
 
-;; Package-Requires: ((emacs "30.1"))
+;; Author: Daniel Nagy
+;; Version: 0.1.0
+;; Keywords: tools
+;; Package-Requires: ((emacs "30.1") (memoize "0"))
+
+;;; Commentary:
+
+;; `derivation' creates derived buffers: buffers whose content is the
+;; result of piping another buffer through an external command.
+;; Think of it as a live, memoized shell pipeline between buffers.
+;;
+;; Setup:
+;;
+;;   (require 'derivation)
+;;
+;;   ;; Derive *json-out* from foo.json by running `jq` on every change.
+;;   (setq derivation--storage
+;;         (list
+;;          (make-deriver
+;;           "jq"                               ; command
+;;           (get-buffer-create "foo.json")      ; source
+;;           (get-buffer-create "*json-out*")    ; target
+;;           "."                                 ; extra args to jq
+;;           "-C")))
+;;
+;;   ;; Derive *yaml-out* from *json-out* (a pipeline of two buffers).
+;;   (push (make-deriver
+;;          "yq" "-p=json" "-o=yaml"
+;;          (get-buffer-create "*json-out*")
+;;          (get-buffer-create "*yaml-out*"))
+;;         derivation--storage)
+;;
+;;   ;; Run derivations on idle.
+;;   (run-with-idle-timer 0.1 t #'run-hooks-derivation)
+;;
+;; Because the deriver is memoized per source-buffer tick, calling it
+;; repeatedly when the source hasn't changed is a no-op — ideal for
+;; idle timers.
+
+;;; Code:
 
 ;; NIX-EMACS-PACKAGE: memoize
 (require 'memoize)
 
 (defun memoize-by-buffer-contents--wrap-buf (func buf)
-  "Adaptation from library `memoize.el'."
-  (let ((memoization-table (make-hash-table :test 'equal :weakness 'key))
-        (buffer-to-contents-table (make-hash-table :weakness 'key))
-        (contents-to-memoization-table (make-hash-table :weakness 'key)))
+  "Return a memoized version of FUNC that invalidates when BUF is modified.
+The cache key is (BUF . BUFFER-MODIFIED-TICK)."
+  (let ((memoization-table (make-hash-table :test 'equal :weakness 'key)))
     (lambda (&rest args)
       (let* ((buftick (cons buf (buffer-chars-modified-tick buf)))
              (memokey (cons buftick args))
              (value (gethash memokey memoization-table)))
         (or value
-            (progn
-              (puthash buf buftick buffer-to-contents-table)
-              (puthash buftick memokey contents-to-memoization-table)
-              (puthash memokey (apply func args) memoization-table)))))))
+            (puthash memokey (apply func args) memoization-table))))))
 
-(defvar derivation--storage nil)
-(defun make-deriver (command frombuf tobuf &rest rest)
-  "Return a new symbol function with no arguments, that applies the changes
-to the buffer.
+(defvar derivation--storage nil
+  "List of deriver functions to run via `run-hooks-derivation'.
+Each element should be a function returned by `make-deriver'.")
 
-The returned function is memoized, so you can call it often without it
-impeding performance."
-  (let ((outsym (gensym "derivation--tracker-"))
-        (buf (if (bufferp frombuf)
-                 frombuf
-               (get-buffer frombuf))))
-    (fset outsym
+(defun make-deriver (command frombuf tobuf &rest args)
+  "Create a memoized function that derives TOBUF from FROMBUF via COMMAND.
+
+FROMBUF and TOBUF may be buffers or buffer names.  COMMAND is an
+executable name (looked up on PATH).  Any extra ARGS are passed as
+arguments to COMMAND.
+
+The returned function takes no arguments.  When called, it pipes the
+contents of FROMBUF through COMMAND and replaces the contents of TOBUF
+with the output.  The result is memoized: if FROMBUF hasn't been
+modified since the last call, TOBUF is left untouched."
+  (let ((tracker (gensym "derivation--tracker-"))
+        (buf (if (bufferp frombuf) frombuf (get-buffer frombuf))))
+    (fset tracker
           (lambda ()
-            (let ((it (with-current-buffer frombuf
-                        (buffer-substring-no-properties (point-min) (point-max)))))
+            (let ((content (with-current-buffer buf
+                             (buffer-substring-no-properties
+                              (point-min) (point-max)))))
               (with-current-buffer tobuf
                 (save-excursion
                   (atomic-change-group
                     (erase-buffer)
                     (insert (with-temp-buffer
-                              (let* ((default-process-coding-system '(no-conversion . no-conversion))
-                                     (exitcode (apply #'call-process-region
-                                                     `(,it
-                                                       nil
-                                                       ,command nil
-                                                       ,(list (current-buffer) t)
-                                                       nil
-                                                       ,@rest))))
+                              (let* ((coding '(no-conversion . no-conversion))
+                                     (default-process-coding-system coding)
+                                     (exitcode
+                                      (apply #'call-process-region
+                                             content nil command nil
+                                             (list (current-buffer) t) nil
+                                             args)))
                                 (if (zerop exitcode)
                                     (string-trim (buffer-string))
                                   (buffer-string)))))))))
             t))
-    (fset outsym (memoize-by-buffer-contents--wrap-buf (symbol-function outsym)
-                                                       buf))
-    outsym))
+    (fset tracker
+          (memoize-by-buffer-contents--wrap-buf
+           (symbol-function tracker) buf))
+    tracker))
 
 (defun run-hooks-derivation ()
+  "Run all derivers in `derivation--storage'.
+Intended to be called from an idle timer or manually."
   (interactive)
   (run-hooks 'derivation--storage))
-;(run-with-idle-timer 0.1 t #'run-hooks-derivation)
-
-;; (setq derivation--storage (list (make-deriver "yj"
-;;                                               (get-buffer "foo.toml")
-;;                                               (get-buffer-create "*baz*")
-;;                                               "-tj" "-i")
-;;                                 (make-deriver "yqMP"
-;;                                               (get-buffer-create "*baz*")
-;;                                               (get-buffer-create "*quux*"))
-;;                                 (make-deriver "yj"
-;;                                               (get-buffer-create "*quux*")
-;;                                               (get-buffer-create "*zott*")
-;;                                               "-yt" "-i")))
-
-;; (setq derivation--storage
-;;       (list (make-deriver "/tmp/t106/hello"
-;;                           ;; (get-buffer-create "rose.webp")
-;;                           (get-buffer-create "gopher.png")
-;;                           (get-buffer-create "*f*"))
-;;             (make-deriver "jq"
-;;                           (get-buffer-create "*f*")
-;;                           (get-buffer-create "*g*"))))
 
 (provide 'derivation)
 ;;; derivation.el ends here

@@ -68,8 +68,9 @@ The cache key is (BUF . BUFFER-MODIFIED-TICK)."
       (let* ((buftick (cons buf (buffer-chars-modified-tick buf)))
              (memokey (cons buftick args))
              (value (gethash memokey memoization-table)))
-        (or value
-            (puthash memokey (apply func args) memoization-table))))))
+        (if (null value)
+            (puthash memokey (apply func args) memoization-table)
+          value)))))
 
 (defvar derivation--storage nil
   "List of deriver functions to run via `run-hooks-derivation'.
@@ -94,20 +95,19 @@ modified since the last call, TOBUF is left untouched."
                              (buffer-substring-no-properties
                               (point-min) (point-max)))))
               (with-current-buffer tobuf
-                (save-excursion
-                  (atomic-change-group
-                    (erase-buffer)
-                    (insert (with-temp-buffer
-                              (let* ((coding '(no-conversion . no-conversion))
-                                     (default-process-coding-system coding)
-                                     (exitcode
-                                      (apply #'call-process-region
-                                             content nil command nil
-                                             (list (current-buffer) t) nil
-                                             args)))
-                                (if (zerop exitcode)
-                                    (string-trim (buffer-string))
-                                  (buffer-string)))))))))
+                (with-silent-modifications
+                  (erase-buffer)
+                  (insert (with-temp-buffer
+                            (let* ((coding '(no-conversion . no-conversion))
+                                   (default-process-coding-system coding)
+                                   (exitcode
+                                    (apply #'call-process-region
+                                           content nil command nil
+                                           (list (current-buffer) t) nil
+                                           args)))
+                              (if (zerop exitcode)
+                                  (string-trim (buffer-string))
+                                (buffer-string))))))))
             t))
     (fset tracker
           (memoize-by-buffer-contents--wrap-buf

@@ -19,7 +19,7 @@
 ;; Author: Daniel Nagy
 ;; Version: 0.1.0
 ;; Keywords: tools
-;; Package-Requires: ((emacs "30.1") (memoize "0"))
+;; Package-Requires: ((emacs "30.1"))
 
 ;;; Commentary:
 
@@ -58,8 +58,6 @@
 ;;; Code:
 
 (require 'cl-lib)
-;; NIX-EMACS-PACKAGE: memoize
-(require 'memoize)
 
 (defun memoize-by-buffer-contents--wrap-buf (func buf)
   "Return a memoized version of FUNC that invalidates when BUF is modified.

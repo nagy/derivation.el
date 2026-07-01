@@ -6,24 +6,16 @@
   melpaBuild ? emacsPackages.melpaBuild,
 }:
 
-let
-  emacsWithPackages = emacs.pkgs.withPackages
-    (epkgs: [ epkgs.memoize ]);
-in
 melpaBuild (finalAttrs: {
   pname = "derivation";
   version = "0.1.0";
   src = lib.cleanSource ./.;
 
-  emacs = emacsWithPackages;
-
-  packageRequires = [ emacsPackages.memoize ];
-
   turnCompilationWarningToError = true;
 
   checkPhase = ''
     runHook preCheck
-    ${emacsWithPackages}/bin/emacs --batch -L . \
+    emacs --batch -L . \
       -l derivation-tests.el \
       -f ert-run-tests-batch-and-exit
     runHook postCheck

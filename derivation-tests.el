@@ -100,6 +100,46 @@
       (should (equal (buffer-string) "xyz")))
     (derivation-test--kill-buffers (list bufs))))
 
+(ert-deftest derivation-function ()
+  "Derivation via an Elisp function."
+  (let* ((bufs (derivation-test--with-buffers "hello"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (make-deriver #'upcase src dst)))
+    (funcall deriver)
+    (with-current-buffer dst
+      (should (equal (buffer-string) "HELLO")))
+    (derivation-test--kill-buffers (list bufs))))
+
+(ert-deftest derivation-function-base64 ()
+  "Derivation via `base64-encode-string'."
+  (let* ((bufs (derivation-test--with-buffers "abc"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (make-deriver #'base64-encode-string src dst)))
+    (funcall deriver)
+    (with-current-buffer dst
+      (should (equal (buffer-string) (base64-encode-string "abc"))))
+    (derivation-test--kill-buffers (list bufs))))
+
+(ert-deftest derivation-function-memoized ()
+  "Function derivation is memoized like external commands."
+  (let* ((bufs (derivation-test--with-buffers "x"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (make-deriver #'upcase src dst)))
+    (funcall deriver)
+    (should (equal (with-current-buffer dst (buffer-string)) "X"))
+    ;; Tamper target — memoization should preserve it.
+    (with-current-buffer dst (erase-buffer) (insert "tampered"))
+    (funcall deriver)
+    (should (equal (with-current-buffer dst (buffer-string)) "tampered"))
+    ;; Change source — should recompute.
+    (with-current-buffer src (erase-buffer) (insert "y"))
+    (funcall deriver)
+    (should (equal (with-current-buffer dst (buffer-string)) "Y"))
+    (derivation-test--kill-buffers (list bufs))))
+
 (ert-deftest derivation-multiple-calls ()
   "Repeated calls without source change return cached result."
   (skip-unless (executable-find "cat"))

@@ -57,6 +57,7 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 ;; NIX-EMACS-PACKAGE: memoize
 (require 'memoize)
 
@@ -79,13 +80,17 @@ Each element should be a function returned by `make-deriver'.")
 (defun make-deriver (command frombuf tobuf &rest args)
   "Create a memoized function that derives TOBUF from FROMBUF via COMMAND.
 
-FROMBUF and TOBUF may be buffers or buffer names.  COMMAND is an
-executable name (looked up on PATH).  Any extra ARGS are passed as
-arguments to COMMAND.
+FROMBUF and TOBUF may be buffers or buffer names.
 
-The returned function takes no arguments.  When called, it pipes the
-contents of FROMBUF through COMMAND and replaces the contents of TOBUF
-with the output.  The result is memoized: if FROMBUF hasn't been
+COMMAND may be:
+  - A string: an external program run via `call-process-region'.
+    Extra ARGS are passed as arguments to the command.
+  - A function: called with the source buffer contents as its only
+    argument.  ARGS are ignored.
+
+The returned function takes no arguments.  When called, it transforms
+the contents of FROMBUF through COMMAND and replaces the contents of
+TOBUF with the output.  The result is memoized: if FROMBUF hasn't been
 modified since the last call, TOBUF is left untouched."
   (let ((tracker (gensym "derivation--tracker-"))
         (buf (if (bufferp frombuf) frombuf (get-buffer frombuf))))
@@ -97,17 +102,25 @@ modified since the last call, TOBUF is left untouched."
               (with-current-buffer tobuf
                 (with-silent-modifications
                   (erase-buffer)
-                  (insert (with-temp-buffer
-                            (let* ((coding '(no-conversion . no-conversion))
-                                   (default-process-coding-system coding)
-                                   (exitcode
-                                    (apply #'call-process-region
-                                           content nil command nil
-                                           (list (current-buffer) t) nil
-                                           args)))
-                              (if (zerop exitcode)
-                                  (string-trim (buffer-string))
-                                (buffer-string))))))))
+                  (insert
+                   (cl-typecase command
+                     (string
+                      (with-temp-buffer
+                        (let* ((coding '(no-conversion . no-conversion))
+                               (default-process-coding-system coding)
+                               (exitcode
+                                (apply #'call-process-region
+                                       content nil command nil
+                                       (list (current-buffer) t) nil
+                                       args)))
+                          (if (zerop exitcode)
+                              (string-trim (buffer-string))
+                            (buffer-string)))))
+                     (function
+                      (funcall command content))
+                     (t
+                      (error "COMMAND must be a string or function, got %S"
+                             (type-of command))))))))
             t))
     (fset tracker
           (memoize-by-buffer-contents--wrap-buf

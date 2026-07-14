@@ -43,9 +43,10 @@
 ;;
 ;;   ;; Derive *yaml-out* from *json-out* (a pipeline of two buffers).
 ;;   (push (make-deriver
-;;          "yq" "-p=json" "-o=yaml"
+;;          "yq"
 ;;          (get-buffer-create "*json-out*")
-;;          (get-buffer-create "*yaml-out*"))
+;;          (get-buffer-create "*yaml-out*")
+;;          "-p" "json" "-o" "yaml")
 ;;         derivation--storage)
 ;;
 ;;   ;; Run derivations on idle.

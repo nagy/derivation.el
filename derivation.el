@@ -49,6 +49,13 @@
 ;;          "-p" "json" "-o" "yaml")
 ;;         derivation--storage)
 ;;
+;;   ;; Derive *baz* from *foo* via `base64-encode-string'.
+;;   (push (make-deriver
+;;          #'base64-encode-string
+;;          (get-buffer-create "*foo*")
+;;          (get-buffer-create "*baz*"))
+;;         derivation--storage)
+;;
 ;;   ;; Run derivations on idle.
 ;;   (run-with-idle-timer 0.1 t #'run-hooks-derivation)
 ;;
@@ -92,7 +99,8 @@ the contents of FROMBUF through COMMAND and replaces the contents of
 TOBUF with the output.  The result is memoized: if FROMBUF hasn't been
 modified since the last call, TOBUF is left untouched."
   (let ((tracker (gensym "derivation--tracker-"))
-        (buf (if (bufferp frombuf) frombuf (get-buffer frombuf))))
+        (buf (if (bufferp frombuf) frombuf (get-buffer frombuf)))
+        inner)
     (fset tracker
           (lambda ()
             (let ((content (with-current-buffer buf
@@ -121,10 +129,44 @@ modified since the last call, TOBUF is left untouched."
                       (error "COMMAND must be a string or function, got %S"
                              (type-of command))))))))
             t))
+    (setq inner (symbol-function tracker))
     (fset tracker
-          (memoize-by-buffer-contents--wrap-buf
-           (symbol-function tracker) buf))
+          (memoize-by-buffer-contents--wrap-buf inner buf))
+    (with-current-buffer tobuf
+      (setq-local derivation--source (cons buf inner)))
     tracker))
+
+(defvar-local derivation--source nil
+  "When non-nil, this buffer is a derivation target.
+Value is (SOURCE-BUFFER . MEMOIZED-DERIVER).")
+
+(defvar derivation-mode-line
+  '(:eval (when derivation--source
+            (propertize " ⟳"
+                        'help-echo (format "derived from %s"
+                                           (buffer-name (car derivation--source)))
+                        'mouse-face 'mode-line-highlight
+                        'local-map (let ((map (make-sparse-keymap)))
+                                     (define-key map [mode-line mouse-1]
+                                                 #'derivation-jump-to-source)
+                                     map))))
+  "Mode-line construct showing derivation status.
+Add to `mode-line-format' to see which buffers are derived.
+Click to jump to the source buffer.")
+
+(defun derivation-rerun ()
+  "Re-run the derivation that produced the current buffer."
+  (interactive)
+  (if derivation--source
+      (funcall (cdr derivation--source))
+    (user-error "Buffer is not a derivation target")))
+
+(defun derivation-jump-to-source ()
+  "Switch to the source buffer of this derivation target."
+  (interactive)
+  (if derivation--source
+      (switch-to-buffer (car derivation--source))
+    (user-error "Buffer is not a derivation target")))
 
 (defun run-hooks-derivation ()
   "Run all derivers in `derivation--storage'.

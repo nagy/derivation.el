@@ -159,5 +159,71 @@
       (should (equal (with-current-buffer dst (buffer-string)) "fixed")))
     (derivation-test--kill-buffers (list bufs))))
 
+
+(ert-deftest derivation--source-is-set ()
+  "Target buffer gets derivation--source set by make-deriver."
+  (let* ((bufs (derivation-test--with-buffers "hello"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (make-deriver #'upcase src dst)))
+    (funcall deriver)
+    (with-current-buffer dst
+      (should derivation--source)
+      (should (bufferp (car derivation--source)))
+      (should (functionp (cdr derivation--source))))
+    (derivation-test--kill-buffers (list bufs))))
+
+(ert-deftest derivation--source-is-nil-in-other-buffers ()
+  "derivation--source is nil in non-derivation buffers."
+  (with-temp-buffer
+    (should-not derivation--source)))
+
+(ert-deftest derivation-rerun ()
+  "derivation-rerun re-runs the derivation, bypassing memoization."
+  (let* ((bufs (derivation-test--with-buffers "hello"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (make-deriver #'upcase src dst)))
+    (funcall deriver)
+    (with-current-buffer dst
+      (should (equal (buffer-string) "HELLO"))
+      (erase-buffer) (insert "tampered")
+      (derivation-rerun)
+      (should (equal (buffer-string) "HELLO")))
+    (derivation-test--kill-buffers (list bufs))))
+
+(ert-deftest derivation-jump-to-source ()
+  "derivation-jump-to-source switches to the source buffer."
+  (let* ((bufs (derivation-test--with-buffers "hello"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (make-deriver #'upcase src dst)))
+    (funcall deriver)
+    (with-current-buffer dst
+      (derivation-jump-to-source)
+      (should (eq (current-buffer) src)))
+    (derivation-test--kill-buffers (list bufs))))
+
+(ert-deftest derivation-mode-line-form-evaluates ()
+  "The :eval form in derivation-mode-line returns propertized string."
+  (let* ((bufs (derivation-test--with-buffers "hello"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (make-deriver #'upcase src dst)))
+    (funcall deriver)
+    (with-current-buffer dst
+      (let ((result (eval (cadr derivation-mode-line))))
+        (should (stringp result))
+        (should (string-match "⟳" result))
+        (should (get-text-property 0 'help-echo result))
+        (should (eq 'mode-line-highlight
+                  (get-text-property 0 'mouse-face result)))))
+    (derivation-test--kill-buffers (list bufs))))
+
+(ert-deftest derivation-mode-line-form-nil-when-not-set ()
+  "The :eval form returns nil in non-derived buffers."
+  (with-temp-buffer
+    (should-not (eval (cadr derivation-mode-line)))))
+
 (provide 'derivation-tests)
 ;;; derivation-tests.el ends here

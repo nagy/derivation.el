@@ -225,5 +225,82 @@
   (with-temp-buffer
     (should-not (eval (cadr derivation-mode-line)))))
 
+;;; Variable derivation tests
+
+;; Declare test variables as dynamic so make-var-deriver can resolve
+;; them via `symbol-value' and `set'.
+(defvar derivation-test--foo)
+(defvar derivation-test--baz)
+
+(ert-deftest derivation-var-basic ()
+  "Variable derivation: `baz' derives from `foo' via `length'."
+  (let ((derivation-test--foo (list 1 2 3))
+        derivation-test--baz)
+    (let ((deriver (make-var-deriver #'length 'derivation-test--foo
+                                     'derivation-test--baz)))
+      (funcall deriver)
+      (should (equal derivation-test--baz
+                     (length derivation-test--foo))))))
+
+(ert-deftest derivation-var-memoization ()
+  "Variable derivation is memoized when source hasn't changed."
+  (let ((derivation-test--foo (list 1 2 3))
+        derivation-test--baz)
+    (let ((deriver (make-var-deriver #'length 'derivation-test--foo
+                                     'derivation-test--baz)))
+      (funcall deriver)
+      (should (equal derivation-test--baz 3))
+      ;; Tamper with target — memoization should prevent overwrite.
+      (setq derivation-test--baz 99)
+      (funcall deriver)
+      (should (equal derivation-test--baz 99)))))
+
+(ert-deftest derivation-var-source-change ()
+  "Variable derivation recomputes when source variable changes."
+  (let ((derivation-test--foo (list 1 2 3))
+        derivation-test--baz)
+    (let ((deriver (make-var-deriver #'length 'derivation-test--foo
+                                     'derivation-test--baz)))
+      (funcall deriver)
+      (should (equal derivation-test--baz 3))
+      ;; Change source — should recompute.
+      (setq derivation-test--foo (list 1 2 3 4 5))
+      (funcall deriver)
+      (should (equal derivation-test--baz 5)))))
+
+(ert-deftest derivation-var-mutation ()
+  "Variable derivation catches in-place mutations via equal fallback.
+
+A setcar on the source list does not fire the variable watcher,
+so the generation counter stays the same.  The `equal' check detects
+the in-place change and triggers recomputation regardless."
+  (let ((derivation-test--foo (list 1 2 3))
+        derivation-test--baz)
+    (let ((deriver (make-var-deriver #'length 'derivation-test--foo
+                                     'derivation-test--baz)))
+      (funcall deriver)
+      (should (equal derivation-test--baz 3))
+      ;; Mutate in place — no watcher fires for setcar,
+      ;; but equal-check detects the change.
+      (setcar derivation-test--foo 42)
+      (funcall deriver)
+      ;; Still 3 elements, but derivation recomputed.
+      (should (equal derivation-test--baz 3))
+      ;; Now add an element in place.
+      (setcdr (last derivation-test--foo) '(4))
+      (funcall deriver)
+      (should (equal derivation-test--baz 4)))))
+
+(ert-deftest derivation-var-multiple-calls ()
+  "Repeated calls without source change don't re-derive."
+  (let ((derivation-test--foo (list 1 2 3))
+        derivation-test--baz)
+    (let ((deriver (make-var-deriver #'length 'derivation-test--foo
+                                     'derivation-test--baz)))
+      (funcall deriver)
+      (dotimes (_ 10)
+        (funcall deriver)
+        (should (equal derivation-test--baz 3))))))
+
 (provide 'derivation-tests)
 ;;; derivation-tests.el ends here

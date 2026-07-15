@@ -1,4 +1,4 @@
-;;; derivation.el --- Live buffer derivation via external commands -*- lexical-binding: t -*-
+;;; derivation.el --- Live buffer and variable derivation -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2026  Daniel Nagy
 
@@ -23,8 +23,10 @@
 
 ;;; Commentary:
 
-;; `derivation' creates derived buffers: buffers whose content is the
-;; result of piping another buffer through an external command.
+;; `derivation' creates derived buffers and variables: buffers whose
+;; content is the result of piping another buffer through an external
+;; command, and variables whose value is derived from other variables
+;; via an Elisp function.
 ;; Think of it as a live, memoized shell pipeline between buffers.
 ;;
 ;; Setup:
@@ -55,13 +57,15 @@
 ;;          (get-buffer-create "*foo*")
 ;;          (get-buffer-create "*baz*"))
 ;;         derivation--storage)
+;;   ;; Derive variable `baz' from `foo' via `length'.
+;;   (push (make-var-deriver #'length 'foo 'baz)
+;;         derivation--storage)
 ;;
 ;;   ;; Run derivations on idle.
 ;;   (run-with-idle-timer 0.1 t #'run-hooks-derivation)
 ;;
-;; Because the deriver is memoized per source-buffer tick, calling it
-;; repeatedly when the source hasn't changed is a no-op — ideal for
-;; idle timers.
+;; Because derivations are memoized, calling them repeatedly when the
+;; source hasn't changed is a no-op — ideal for idle timers.
 
 ;;; Code:
 
@@ -81,7 +85,8 @@ The cache key is (BUF . BUFFER-MODIFIED-TICK)."
 
 (defvar derivation--storage nil
   "List of deriver functions to run via `run-hooks-derivation'.
-Each element should be a function returned by `make-deriver'.")
+Each element should be a function returned by `make-deriver' or
+`make-var-deriver'.")
 
 (defun make-deriver (command frombuf tobuf &rest args)
   "Create a memoized function that derives TOBUF from FROMBUF via COMMAND.
@@ -135,6 +140,47 @@ modified since the last call, TOBUF is left untouched."
     (with-current-buffer tobuf
       (setq-local derivation--source (cons buf inner)))
     tracker))
+
+;;; Variable derivation
+
+(defvar derivation--var-watch-table (make-hash-table :test 'eq)
+  "Table mapping source symbols to their generation counter.
+Each symbol's counter increments on every `setq' or `set' of
+that symbol, via `add-variable-watcher'.")
+
+(defun derivation--var-bump (symbol _newval _op _where)
+  "Increment the generation counter for SYMBOL.
+Installed as a variable watcher.  _OP is the change operation
+\(set, makunbound, let)."
+  (cl-incf (gethash symbol derivation--var-watch-table 0)))
+
+;;;###autoload
+(defun make-var-deriver (func fromvar tovar)
+  "Create a memoized function that derives TOVAR from FROMVAR via FUNC.
+
+FUNC is called with the value of FROMVAR as its sole argument.
+The return value is assigned to TOVAR via `set'.
+
+The returned function takes no arguments and is compatible with
+`run-hooks-derivation': just push it onto `derivation--storage'.
+
+Memoization is hybrid: a variable watcher provides a fast \"not
+dirty\" check, and an `equal' value comparison catches in-place
+mutations that the watcher would miss."
+  ;; Install one watcher per variable, ever.
+  (unless (gethash fromvar derivation--var-watch-table)
+    (puthash fromvar 0 derivation--var-watch-table)
+    (add-variable-watcher fromvar #'derivation--var-bump))
+  (let ((last-gen -1)
+        (last-value nil))
+    (lambda ()
+      (let ((cur-gen (gethash fromvar derivation--var-watch-table 0))
+            (cur-val (symbol-value fromvar)))
+        (when (or (/= cur-gen last-gen)
+                  (not (equal cur-val last-value)))
+          (setq last-gen cur-gen
+                last-value (copy-tree cur-val))
+          (set tovar (funcall func cur-val)))))))
 
 (defvar-local derivation--source nil
   "When non-nil, this buffer is a derivation target.

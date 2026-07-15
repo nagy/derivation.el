@@ -144,15 +144,18 @@ modified since the last call, TOBUF is left untouched."
 ;;; Variable derivation
 
 (defvar derivation--var-watch-table (make-hash-table :test 'eq)
-  "Table mapping source symbols to their generation counter.
-Each symbol's counter increments on every `setq' or `set' of
-that symbol, via `add-variable-watcher'.")
+  "Table mapping source symbols to (GENERATION . REFCOUNT) cons cells.
+GENERATION increments on every `setq' or `set' of the symbol via
+`add-variable-watcher'.  REFCOUNT tracks how many derivers are
+watching this symbol; when it reaches zero, the watcher is removed.")
 
 (defun derivation--var-bump (symbol _newval _op _where)
   "Increment the generation counter for SYMBOL.
 Installed as a variable watcher.  _OP is the change operation
 \(set, makunbound, let)."
-  (cl-incf (gethash symbol derivation--var-watch-table 0)))
+  (let ((entry (gethash symbol derivation--var-watch-table)))
+    (when entry
+      (cl-incf (car entry)))))
 
 ;;;###autoload
 (defun make-var-deriver (func fromvar tovar)
@@ -166,21 +169,44 @@ The returned function takes no arguments and is compatible with
 
 Memoization is hybrid: a variable watcher provides a fast \"not
 dirty\" check, and an `equal' value comparison catches in-place
-mutations that the watcher would miss."
-  ;; Install one watcher per variable, ever.
-  (unless (gethash fromvar derivation--var-watch-table)
-    (puthash fromvar 0 derivation--var-watch-table)
-    (add-variable-watcher fromvar #'derivation--var-bump))
-  (let ((last-gen -1)
-        (last-value nil))
-    (lambda ()
-      (let ((cur-gen (gethash fromvar derivation--var-watch-table 0))
-            (cur-val (symbol-value fromvar)))
-        (when (or (/= cur-gen last-gen)
-                  (not (equal cur-val last-value)))
-          (setq last-gen cur-gen
-                last-value (copy-tree cur-val))
-          (set tovar (funcall func cur-val)))))))
+mutations that the watcher would miss.
+
+When the returned deriver function is garbage-collected, the
+variable watcher on FROMVAR is automatically removed (once no
+other derivers reference it)."
+  (let* ((entry (gethash fromvar derivation--var-watch-table))
+         (last-gen -1)
+         (last-value nil)
+         (cleanup
+          (lambda ()
+            (let ((entry (gethash fromvar derivation--var-watch-table)))
+              (when entry
+                (cl-decf (cdr entry))
+                (when (zerop (cdr entry))
+                  (remove-variable-watcher fromvar #'derivation--var-bump)
+                  (remhash fromvar derivation--var-watch-table))))))
+         ;; make-finalizer returns a token whose GC triggers cleanup.
+         ;; We capture the token in deriver's closure so it lives
+         ;; exactly as long as deriver does.
+         (finalizer-token (make-finalizer cleanup))
+         (deriver nil))
+    ;; Install or bump refcount.
+    (if entry
+        (cl-incf (cdr entry))
+      (puthash fromvar (cons 0 1) derivation--var-watch-table)
+      (add-variable-watcher fromvar #'derivation--var-bump))
+    (setq deriver
+          (lambda ()
+            (ignore finalizer-token)
+            (let ((cur-gen (car (gethash fromvar derivation--var-watch-table
+                                         '(0 . 0))))
+                  (cur-val (symbol-value fromvar)))
+              (when (or (/= cur-gen last-gen)
+                        (not (equal cur-val last-value)))
+                (setq last-gen cur-gen
+                      last-value (copy-tree cur-val))
+                (set tovar (funcall func cur-val))))))
+    deriver))
 
 (defvar-local derivation--source nil
   "When non-nil, this buffer is a derivation target.

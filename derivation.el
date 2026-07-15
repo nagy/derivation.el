@@ -208,6 +208,74 @@ other derivers reference it)."
                 (set tovar (funcall func cur-val))))))
     deriver))
 
+;;; Section filter derivation
+
+(defun derivation--walk-sections (root predicate)
+  "Collect buffer text of descendants of ROOT matching PREDICATE.
+PREDICATE is called with each section; sections for which it
+returns non-nil are included.  The source buffer must be current.
+Returns a list of strings in document order."
+  (let ((results nil))
+    (cl-labels ((walk (section)
+                  (when (funcall predicate section)
+                    (push (with-no-warnings
+                            (buffer-substring (slot-value section 'start)
+                                              (slot-value section 'end)))
+                          results))
+                  (dolist (child (with-no-warnings
+                                   (slot-value section 'children)))
+                    (walk child))))
+      (dolist (child (with-no-warnings (slot-value root 'children)))
+        (walk child)))
+    (nreverse results)))
+
+;;;###autoload
+(defun make-section-filter (predicate frombuf tobuf)
+  "Create a memoized function that copies matching sections to TOBUF.
+
+FROMBUF is a buffer using magit-section (e.g., a magit buffer).
+PREDICATE is called with each top-level child section of FROMBUF
+(with FROMBUF current).  Sections for which PREDICATE returns
+non-nil have their buffer text (including text properties)
+copied to TOBUF, separated by newlines.
+
+The returned function takes no arguments and is compatible with
+\=`run-hooks-derivation\=': just push it onto \=`derivation--storage\='.
+
+Memoization is keyed on FROMBUF's buffer-chars-modified-tick.
+
+Example that filters magit-process to show only failed commands:
+
+  (push (make-section-filter
+         (lambda (section)
+           (let ((proc (slot-value section \='value)))
+             (and (processp proc)
+                  (numberp (process-exit-status proc))
+                  (/= 0 (process-exit-status proc)))))
+         (magit-process-buffer t)
+         (get-buffer-create \"*magit-failures*\"))
+        derivation--storage)"
+  (let ((buf (if (bufferp frombuf) frombuf (get-buffer frombuf))))
+    (memoize-by-buffer-contents--wrap-buf
+     (lambda ()
+       (let ((text
+              (with-current-buffer buf
+                (if (and (boundp 'magit-root-section)
+                         (local-variable-p 'magit-root-section)
+                         magit-root-section)
+                    (string-join
+                     (derivation--walk-sections magit-root-section predicate)
+                     "\n")
+                  (buffer-string)))))
+         (with-current-buffer tobuf
+           (with-silent-modifications
+             (erase-buffer)
+             (insert text)))
+         t))
+     buf)))
+
+
+
 (defvar-local derivation--source nil
   "When non-nil, this buffer is a derivation target.
 Value is (SOURCE-BUFFER . MEMOIZED-DERIVER).")

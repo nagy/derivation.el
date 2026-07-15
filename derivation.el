@@ -208,33 +208,41 @@ other derivers reference it)."
                 (set tovar (funcall func cur-val))))))
     deriver))
 
-;;; Section filter derivation
+;;; Generic tree walk
 
-(defun derivation--walk-sections (root predicate)
-  "Collect buffer text of descendants of ROOT matching PREDICATE.
-PREDICATE is called with each section; sections for which it
-returns non-nil are included.  The source buffer must be current.
-Returns a list of strings in document order."
+(cl-defgeneric derivation--node-children (_node)
+  "Return the children of NODE as a list, or nil.
+
+The default method handles EIEIO objects that have a `children'
+slot.  Additional methods can be defined for hash tables, alists,
+lists, vectors, etc. — enabling new deriver types (map-filter,
+seq-filter, etc.) without changing the tree walker."
+  (when (and (fboundp 'eieio-object-p)
+             (eieio-object-p _node)
+             (with-no-warnings (slot-exists-p _node 'children)))
+    (with-no-warnings (slot-value _node 'children))))
+
+(defun derivation--walk-tree (root predicate)
+  "Traverse tree from ROOT, collecting nodes matching PREDICATE.
+Uses `derivation--node-children' to recurse into each node.
+Returns matching nodes in preorder."
   (let ((results nil))
-    (cl-labels ((walk (section)
-                  (when (funcall predicate section)
-                    (push (with-no-warnings
-                            (buffer-substring (slot-value section 'start)
-                                              (slot-value section 'end)))
-                          results))
-                  (dolist (child (with-no-warnings
-                                   (slot-value section 'children)))
+    (cl-labels ((walk (node)
+                  (when (funcall predicate node)
+                    (push node results))
+                  (dolist (child (derivation--node-children node))
                     (walk child))))
-      (dolist (child (with-no-warnings (slot-value root 'children)))
-        (walk child)))
+      (walk root))
     (nreverse results)))
+
+;;; Section filter derivation
 
 ;;;###autoload
 (defun make-section-filter (predicate frombuf tobuf)
   "Create a memoized function that copies matching sections to TOBUF.
 
 FROMBUF is a buffer using magit-section (e.g., a magit buffer).
-PREDICATE is called with each top-level child section of FROMBUF
+PREDICATE is called with each child section of FROMBUF's root
 (with FROMBUF current).  Sections for which PREDICATE returns
 non-nil have their buffer text (including text properties)
 copied to TOBUF, separated by newlines.
@@ -264,7 +272,13 @@ Example that filters magit-process to show only failed commands:
                          (local-variable-p 'magit-root-section)
                          magit-root-section)
                     (string-join
-                     (derivation--walk-sections magit-root-section predicate)
+                     (mapcar
+                      (lambda (section)
+                        (with-no-warnings
+                          (buffer-substring (slot-value section 'start)
+                                            (slot-value section 'end))))
+
+                      (derivation--walk-tree magit-root-section predicate))
                      "\n")
                   (buffer-string)))))
          (with-current-buffer tobuf

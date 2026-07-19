@@ -19,7 +19,7 @@
 ;; Author: Daniel Nagy
 ;; Version: 0.1.0
 ;; Keywords: tools
-;; Package-Requires: ((emacs "30.1"))
+;; Package-Requires: ((emacs "27.1"))
 
 ;;; Commentary:
 
@@ -36,7 +36,7 @@
 ;;   ;; Derive *json-out* from foo.json by running `jq` on every change.
 ;;   (setq derivation--storage
 ;;         (list
-;;          (make-deriver
+;;          (derivation-make-deriver
 ;;           "jq"                               ; command
 ;;           (get-buffer-create "foo.json")      ; source
 ;;           (get-buffer-create "*json-out*")    ; target
@@ -44,7 +44,7 @@
 ;;           "-C")))
 ;;
 ;;   ;; Derive *yaml-out* from *json-out* (a pipeline of two buffers).
-;;   (push (make-deriver
+;;   (push (derivation-make-deriver
 ;;          "yq"
 ;;          (get-buffer-create "*json-out*")
 ;;          (get-buffer-create "*yaml-out*")
@@ -52,43 +52,38 @@
 ;;         derivation--storage)
 ;;
 ;;   ;; Derive *baz* from *foo* via `base64-encode-string'.
-;;   (push (make-deriver
+;;   (push (derivation-make-deriver
 ;;          #'base64-encode-string
 ;;          (get-buffer-create "*foo*")
 ;;          (get-buffer-create "*baz*"))
 ;;         derivation--storage)
 ;;   ;; Derive variable `baz' from `foo' via `length'.
-;;   (push (make-var-deriver #'length 'foo 'baz)
+;;   (push (derivation-make-var-deriver #'length 'foo 'baz)
 ;;         derivation--storage)
 ;;
 ;;   ;; Run derivations on idle.
-;;   (run-with-idle-timer 0.1 t #'run-hooks-derivation)
+;;   (run-with-idle-timer 0.1 t #'derivation-run-hooks)
 ;;
 ;; Because derivations are memoized, calling them repeatedly when the
 ;; source hasn't changed is a no-op — ideal for idle timers.
+;;
+;; Error handling:
+;; When a command fails (non-zero exit), the target buffer keeps its
+;; last good output.  stderr is captured in a hidden buffer, and the
+;; mode-line indicator changes to show the error state.  When the source
+;; is fixed, the derivation recovers automatically on the next run.
 
 ;;; Code:
 
 (require 'cl-lib)
 
-(defun memoize-by-buffer-contents--wrap-buf (func buf)
-  "Return a memoized version of FUNC that invalidates when BUF is modified.
-The cache key is (BUF . BUFFER-MODIFIED-TICK)."
-  (let ((memoization-table (make-hash-table :test 'equal :weakness 'key)))
-    (lambda (&rest args)
-      (let* ((buftick (cons buf (buffer-chars-modified-tick buf)))
-             (memokey (cons buftick args))
-             (value (gethash memokey memoization-table)))
-        (if (null value)
-            (puthash memokey (apply func args) memoization-table)
-          value)))))
-
 (defvar derivation--storage nil
-  "List of deriver functions to run via `run-hooks-derivation'.
-Each element should be a function returned by `make-deriver' or
-`make-var-deriver'.")
+  "List of deriver functions to run via `derivation-run-hooks'.
+Each element should be a function returned by `derivation-make-deriver' or
+`derivation-make-var-deriver'.")
 
-(defun make-deriver (command frombuf tobuf &rest args)
+;;;###autoload
+(defun derivation-make-deriver (command frombuf tobuf &rest args)
   "Create a memoized function that derives TOBUF from FROMBUF via COMMAND.
 
 FROMBUF and TOBUF may be buffers or buffer names.
@@ -101,45 +96,87 @@ COMMAND may be:
 
 The returned function takes no arguments.  When called, it transforms
 the contents of FROMBUF through COMMAND and replaces the contents of
-TOBUF with the output.  The result is memoized: if FROMBUF hasn't been
-modified since the last call, TOBUF is left untouched."
-  (let ((tracker (gensym "derivation--tracker-"))
-        (buf (if (bufferp frombuf) frombuf (get-buffer frombuf)))
-        inner)
-    (fset tracker
+TOBUF with the output.  The result is memoized via FROMBUF's
+buffer-chars-modified-tick: if FROMBUF hasn't been modified since the
+last call, TOBUF is left untouched.
+
+When COMMAND fails (non-zero exit) or the function signals an error,
+the target buffer keeps its last good output.  stderr from failed
+commands is captured in a hidden buffer."
+  (let* ((buf (if (bufferp frombuf) frombuf (get-buffer frombuf)))
+         (tbuf (if (bufferp tobuf) tobuf (get-buffer tobuf)))
+         (last-tick -1)
+         (last-good nil)
+         (errbuf (generate-new-buffer
+                  (format " *derivation-err-%s*" (gensym))))
+         inner)
+    (unless (buffer-live-p tbuf)
+      (error "derivation-make-deriver: target buffer is not live"))
+    (unless (buffer-live-p buf)
+      (error "derivation-make-deriver: source buffer is not live"))
+    (setq inner
           (lambda ()
-            (let ((content (with-current-buffer buf
-                             (buffer-substring-no-properties
-                              (point-min) (point-max)))))
-              (with-current-buffer tobuf
-                (with-silent-modifications
-                  (erase-buffer)
-                  (insert
-                   (cl-typecase command
-                     (string
-                      (with-temp-buffer
-                        (let* ((coding '(no-conversion . no-conversion))
-                               (default-process-coding-system coding)
-                               (exitcode
-                                (apply #'call-process-region
-                                       content nil command nil
-                                       (list (current-buffer) t) nil
-                                       args)))
-                          (if (zerop exitcode)
-                              (string-trim (buffer-string))
-                            (buffer-string)))))
-                     (function
-                      (funcall command content))
-                     (t
-                      (error "COMMAND must be a string or function, got %S"
-                             (type-of command))))))))
-            t))
-    (setq inner (symbol-function tracker))
-    (fset tracker
-          (memoize-by-buffer-contents--wrap-buf inner buf))
-    (with-current-buffer tobuf
+            (let* ((content
+                    (with-current-buffer buf
+                      (buffer-substring-no-properties (point-min) (point-max))))
+                   (result
+                    (cl-typecase command
+                      (string
+                       (let ((stderr-file (make-temp-file "deriv-stderr-"))
+                             (exitcode nil))
+                         (unwind-protect
+                             (with-temp-buffer
+                               (setq exitcode
+                                     (apply #'call-process-region
+                                            content nil command nil
+                                            (list (current-buffer) stderr-file)
+                                            nil args))
+                               (let ((stdout (buffer-string)))
+                                 (if (zerop exitcode)
+                                     (cons 'ok stdout)
+                                   (let ((errtext
+                                          (with-temp-buffer
+                                            (insert-file-contents stderr-file)
+                                            (buffer-string))))
+                                     (cons 'err
+                                           (if (string= errtext "")
+                                               stdout
+                                             errtext))))))
+                           (delete-file stderr-file))))
+                      (function
+                       (condition-case e
+                           (cons 'ok (funcall command content))
+                         (error (cons 'err (error-message-string e)))))
+                      (t
+                       (error "COMMAND must be string or function, got %S"
+                              (type-of command))))))
+              (pcase result
+                (`(ok . ,text)
+                 (setq last-good text)
+                 (with-current-buffer tbuf
+                   (with-silent-modifications
+                     (erase-buffer)
+                     (insert text))
+                   (setq-local derivation--error nil))
+                 (with-current-buffer errbuf
+                   (with-silent-modifications (erase-buffer))))
+                (`(err . ,msg)
+                 (with-current-buffer errbuf
+                   (with-silent-modifications
+                     (erase-buffer)
+                     (insert msg)))
+                 (with-current-buffer tbuf
+                   (setq-local derivation--error msg))))
+              t)))
+    (with-current-buffer tbuf
       (setq-local derivation--source (cons buf inner)))
-    tracker))
+    ;; Return the caching wrapper: dirty-check then maybe call inner.
+    (lambda ()
+      (when (and (buffer-live-p buf) (buffer-live-p tbuf))
+        (let ((tick (buffer-chars-modified-tick buf)))
+          (unless (= tick last-tick)
+            (setq last-tick tick)
+            (funcall inner)))))))
 
 ;;; Variable derivation
 
@@ -158,14 +195,14 @@ Installed as a variable watcher.  _OP is the change operation
       (cl-incf (car entry)))))
 
 ;;;###autoload
-(defun make-var-deriver (func fromvar tovar)
+(defun derivation-make-var-deriver (func fromvar tovar)
   "Create a memoized function that derives TOVAR from FROMVAR via FUNC.
 
 FUNC is called with the value of FROMVAR as its sole argument.
 The return value is assigned to TOVAR via `set'.
 
 The returned function takes no arguments and is compatible with
-`run-hooks-derivation': just push it onto `derivation--storage'.
+`derivation-run-hooks': just push it onto `derivation--storage'.
 
 Memoization is hybrid: a variable watcher provides a fast \"not
 dirty\" check, and an `equal' value comparison catches in-place
@@ -204,7 +241,7 @@ other derivers reference it)."
               (when (or (/= cur-gen last-gen)
                         (not (equal cur-val last-value)))
                 (setq last-gen cur-gen
-                      last-value (copy-tree cur-val))
+                      last-value (copy-tree cur-val t))
                 (set tovar (funcall func cur-val))))))
     deriver))
 
@@ -238,7 +275,7 @@ Returns matching nodes in preorder."
 ;;; Section filter derivation
 
 ;;;###autoload
-(defun make-section-filter (predicate frombuf tobuf)
+(defun derivation-make-section-filter (predicate frombuf tobuf)
   "Create a memoized function that copies matching sections to TOBUF.
 
 FROMBUF is a buffer using magit-section (e.g., a magit buffer).
@@ -248,64 +285,94 @@ non-nil have their buffer text (including text properties)
 copied to TOBUF, separated by newlines.
 
 The returned function takes no arguments and is compatible with
-\=`run-hooks-derivation\=': just push it onto \=`derivation--storage\='.
+`derivation-run-hooks': just push it onto `derivation--storage'.
 
 Memoization is keyed on FROMBUF's buffer-chars-modified-tick.
 
 Example that filters magit-process to show only failed commands:
 
-  (push (make-section-filter
+  (push (derivation-make-section-filter
          (lambda (section)
-           (let ((proc (slot-value section \='value)))
+           (let ((proc (slot-value section \\='value)))
              (and (processp proc)
                   (numberp (process-exit-status proc))
                   (/= 0 (process-exit-status proc)))))
          (magit-process-buffer t)
          (get-buffer-create \"*magit-failures*\"))
         derivation--storage)"
-  (let ((buf (if (bufferp frombuf) frombuf (get-buffer frombuf))))
-    (memoize-by-buffer-contents--wrap-buf
-     (lambda ()
-       (let ((text
-              (with-current-buffer buf
-                (if (and (boundp 'magit-root-section)
-                         (local-variable-p 'magit-root-section)
-                         magit-root-section)
-                    (string-join
-                     (mapcar
-                      (lambda (section)
-                        (with-no-warnings
-                          (buffer-substring (slot-value section 'start)
-                                            (slot-value section 'end))))
-
-                      (derivation--walk-tree magit-root-section predicate))
-                     "\n")
-                  (buffer-string)))))
-         (with-current-buffer tobuf
-           (with-silent-modifications
-             (erase-buffer)
-             (insert text)))
-         t))
-     buf)))
-
-
+  (let* ((buf (if (bufferp frombuf) frombuf (get-buffer frombuf)))
+         (tbuf (if (bufferp tobuf) tobuf (get-buffer tobuf)))
+         (last-tick -1)
+         inner)
+    (unless (buffer-live-p tbuf)
+      (error "derivation-make-section-filter: target buffer is not live"))
+    (unless (buffer-live-p buf)
+      (error "derivation-make-section-filter: source buffer is not live"))
+    (setq inner
+          (lambda ()
+            (let ((text
+                   (with-current-buffer buf
+                     (if (and (boundp 'magit-root-section)
+                              (local-variable-p 'magit-root-section)
+                              magit-root-section)
+                         (mapconcat
+                          (lambda (section)
+                            (with-no-warnings
+                              (buffer-substring (slot-value section 'start)
+                                                (slot-value section 'end))))
+                          (derivation--walk-tree magit-root-section predicate)
+                          "\n")
+                       (buffer-string)))))
+              (with-current-buffer tbuf
+                (with-silent-modifications
+                  (erase-buffer)
+                  (insert text)))
+              t)))
+    (with-current-buffer tbuf
+      (setq-local derivation--source (cons buf inner)))
+    (lambda ()
+      (when (and (buffer-live-p buf) (buffer-live-p tbuf))
+        (let ((tick (buffer-chars-modified-tick buf)))
+          (unless (= tick last-tick)
+            (setq last-tick tick)
+            (funcall inner)))))))
 
 (defvar-local derivation--source nil
   "When non-nil, this buffer is a derivation target.
-Value is (SOURCE-BUFFER . MEMOIZED-DERIVER).")
+Value is (SOURCE-BUFFER . INNER-TRANSFORM-FUNCTION).
+The inner function bypasses the tick cache, used by `derivation-rerun'.")
+
+(defvar-local derivation--error nil
+  "When non-nil, the last derivation produced an error.
+Value is the error message string.  Used by `derivation-mode-line'
+to show an error indicator.")
 
 (defvar derivation-mode-line
   '(:eval (when derivation--source
-            (propertize " ⟳"
-                        'help-echo (format "derived from %s"
-                                           (buffer-name (car derivation--source)))
-                        'mouse-face 'mode-line-highlight
-                        'local-map (let ((map (make-sparse-keymap)))
-                                     (define-key map [mode-line mouse-1]
-                                                 #'derivation-jump-to-source)
-                                     map))))
+            (if derivation--error
+                (propertize " ⟳!"
+                            'face 'error
+                            'help-echo (format "derived from %s (error: %s)"
+                                               (buffer-name
+                                                (car derivation--source))
+                                               derivation--error)
+                            'mouse-face 'mode-line-highlight
+                            'local-map (let ((map (make-sparse-keymap)))
+                                         (define-key map [mode-line mouse-1]
+                                                     #'derivation-jump-to-source)
+                                         map))
+              (propertize " ⟳"
+                          'help-echo (format "derived from %s"
+                                             (buffer-name
+                                              (car derivation--source)))
+                          'mouse-face 'mode-line-highlight
+                          'local-map (let ((map (make-sparse-keymap)))
+                                       (define-key map [mode-line mouse-1]
+                                                   #'derivation-jump-to-source)
+                                       map)))))
   "Mode-line construct showing derivation status.
 Add to `mode-line-format' to see which buffers are derived.
+Shows \"⟳\" normally, \"⟳!\" in error face when the last run failed.
 Click to jump to the source buffer.")
 
 (defun derivation-rerun ()
@@ -322,11 +389,18 @@ Click to jump to the source buffer.")
       (switch-to-buffer (car derivation--source))
     (user-error "Buffer is not a derivation target")))
 
-(defun run-hooks-derivation ()
+(defun derivation-run-hooks ()
   "Run all derivers in `derivation--storage'.
-Intended to be called from an idle timer or manually."
+Intended to be called from an idle timer or manually.
+Errors in individual derivers are caught and reported without
+aborting the remaining derivers."
   (interactive)
-  (run-hooks 'derivation--storage))
+  (dolist (d derivation--storage)
+    (condition-case err
+        (funcall d)
+      (error
+       (message "derivation: error in deriver: %s"
+                (error-message-string err))))))
 
 (provide 'derivation)
 ;;; derivation.el ends here

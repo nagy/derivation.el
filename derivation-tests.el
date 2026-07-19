@@ -35,7 +35,7 @@
     (kill-buffer (cdr pair))))
 
 
-;;; Tests
+;;; Buffer derivation tests
 
 (ert-deftest derivation-identity ()
   "Source content passes through `cat' unchanged into target."
@@ -43,7 +43,7 @@
   (let* ((bufs (derivation-test--with-buffers "hello world"))
          (src (car bufs))
          (dst (cdr bufs))
-         (deriver (make-deriver "cat" src dst)))
+         (deriver (derivation-make-deriver "cat" src dst)))
     (funcall deriver)
     (with-current-buffer dst
       (should (equal (buffer-string) "hello world")))
@@ -55,7 +55,7 @@
   (let* ((bufs (derivation-test--with-buffers "hello world"))
          (src (car bufs))
          (dst (cdr bufs))
-         (deriver (make-deriver "tr" src dst "a-z" "A-Z")))
+         (deriver (derivation-make-deriver "tr" src dst "a-z" "A-Z")))
     (funcall deriver)
     (with-current-buffer dst
       (should (equal (buffer-string) "HELLO WORLD")))
@@ -67,19 +67,16 @@
   (let* ((bufs (derivation-test--with-buffers "v1"))
          (src (car bufs))
          (dst (cdr bufs))
-         (deriver (make-deriver "cat" src dst)))
-    ;; Initial derivation.
+         (deriver (derivation-make-deriver "cat" src dst)))
     (funcall deriver)
     (with-current-buffer dst
       (should (equal (buffer-string) "v1")))
-    ;; Tamper with target manually — memoization should prevent overwrite.
     (with-current-buffer dst
       (erase-buffer)
       (insert "tampered"))
     (funcall deriver)
     (with-current-buffer dst
       (should (equal (buffer-string) "tampered")))
-    ;; Change source — should trigger recomputation.
     (with-current-buffer src
       (erase-buffer)
       (insert "v2"))
@@ -89,12 +86,12 @@
     (derivation-test--kill-buffers (list bufs))))
 
 (ert-deftest derivation-command-args ()
-  "Extra arguments to make-deriver are passed to the command."
+  "Extra arguments to derivation-make-deriver are passed to the command."
   (skip-unless (executable-find "tr"))
   (let* ((bufs (derivation-test--with-buffers "abc"))
          (src (car bufs))
          (dst (cdr bufs))
-         (deriver (make-deriver "tr" src dst "abc" "xyz")))
+         (deriver (derivation-make-deriver "tr" src dst "abc" "xyz")))
     (funcall deriver)
     (with-current-buffer dst
       (should (equal (buffer-string) "xyz")))
@@ -105,7 +102,7 @@
   (let* ((bufs (derivation-test--with-buffers "hello"))
          (src (car bufs))
          (dst (cdr bufs))
-         (deriver (make-deriver #'upcase src dst)))
+         (deriver (derivation-make-deriver #'upcase src dst)))
     (funcall deriver)
     (with-current-buffer dst
       (should (equal (buffer-string) "HELLO")))
@@ -116,7 +113,7 @@
   (let* ((bufs (derivation-test--with-buffers "abc"))
          (src (car bufs))
          (dst (cdr bufs))
-         (deriver (make-deriver #'base64-encode-string src dst)))
+         (deriver (derivation-make-deriver #'base64-encode-string src dst)))
     (funcall deriver)
     (with-current-buffer dst
       (should (equal (buffer-string) (base64-encode-string "abc"))))
@@ -127,14 +124,12 @@
   (let* ((bufs (derivation-test--with-buffers "x"))
          (src (car bufs))
          (dst (cdr bufs))
-         (deriver (make-deriver #'upcase src dst)))
+         (deriver (derivation-make-deriver #'upcase src dst)))
     (funcall deriver)
     (should (equal (with-current-buffer dst (buffer-string)) "X"))
-    ;; Tamper target — memoization should preserve it.
     (with-current-buffer dst (erase-buffer) (insert "tampered"))
     (funcall deriver)
     (should (equal (with-current-buffer dst (buffer-string)) "tampered"))
-    ;; Change source — should recompute.
     (with-current-buffer src (erase-buffer) (insert "y"))
     (funcall deriver)
     (should (equal (with-current-buffer dst (buffer-string)) "Y"))
@@ -146,14 +141,9 @@
   (let* ((bufs (derivation-test--with-buffers "fixed"))
          (src (car bufs))
          (dst (cdr bufs))
-         (deriver (make-deriver "cat" src dst))
-         (call-count 0))
-    ;; Wrap the deriver to count actual (non-memoized) invocations.
-    ;; We detect recomputation by observing that the target reflects
-    ;; source changes.
+         (deriver (derivation-make-deriver "cat" src dst)))
     (funcall deriver)
     (should (equal (with-current-buffer dst (buffer-string)) "fixed"))
-    ;; Multiple calls without source change.
     (dotimes (_ 5)
       (funcall deriver)
       (should (equal (with-current-buffer dst (buffer-string)) "fixed")))
@@ -161,11 +151,11 @@
 
 
 (ert-deftest derivation--source-is-set ()
-  "Target buffer gets derivation--source set by make-deriver."
+  "Target buffer gets derivation--source set by derivation-make-deriver."
   (let* ((bufs (derivation-test--with-buffers "hello"))
          (src (car bufs))
          (dst (cdr bufs))
-         (deriver (make-deriver #'upcase src dst)))
+         (deriver (derivation-make-deriver #'upcase src dst)))
     (funcall deriver)
     (with-current-buffer dst
       (should derivation--source)
@@ -183,7 +173,7 @@
   (let* ((bufs (derivation-test--with-buffers "hello"))
          (src (car bufs))
          (dst (cdr bufs))
-         (deriver (make-deriver #'upcase src dst)))
+         (deriver (derivation-make-deriver #'upcase src dst)))
     (funcall deriver)
     (with-current-buffer dst
       (should (equal (buffer-string) "HELLO"))
@@ -197,7 +187,7 @@
   (let* ((bufs (derivation-test--with-buffers "hello"))
          (src (car bufs))
          (dst (cdr bufs))
-         (deriver (make-deriver #'upcase src dst)))
+         (deriver (derivation-make-deriver #'upcase src dst)))
     (funcall deriver)
     (with-current-buffer dst
       (derivation-jump-to-source)
@@ -209,7 +199,7 @@
   (let* ((bufs (derivation-test--with-buffers "hello"))
          (src (car bufs))
          (dst (cdr bufs))
-         (deriver (make-deriver #'upcase src dst)))
+         (deriver (derivation-make-deriver #'upcase src dst)))
     (funcall deriver)
     (with-current-buffer dst
       (let ((result (eval (cadr derivation-mode-line))))
@@ -225,10 +215,215 @@
   (with-temp-buffer
     (should-not (eval (cadr derivation-mode-line)))))
 
+;;; Error handling tests
+
+(ert-deftest derivation-failure-keeps-last-good ()
+  "When a command fails, the target keeps its last good render."
+  (skip-unless (executable-find "sh"))
+  (let* ((bufs (derivation-test--with-buffers "good"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-deriver
+                   "sh" src dst "-c"
+                   "if grep -q '^bad' /dev/stdin; then echo errmsg >&2; exit 1; else cat; fi")))
+    ;; First run: source is "good", command succeeds, target gets "good".
+    (funcall deriver)
+    (with-current-buffer dst
+      (should (equal (buffer-string) "good"))
+      (should-not derivation--error))
+    ;; Change source to trigger failure.
+    (with-current-buffer src (erase-buffer) (insert "bad content"))
+    (funcall deriver)
+    (with-current-buffer dst
+      (should (equal (buffer-string) "good"))
+      (should derivation--error)
+      (should (string-match "errmsg" derivation--error)))
+    (derivation-test--kill-buffers (list bufs))))
+
+(ert-deftest derivation-failure-recovers ()
+  "After a failure, fixing the source restores the derivation."
+  (skip-unless (executable-find "sh"))
+  (let* ((bufs (derivation-test--with-buffers "good"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-deriver
+                   "sh" src dst "-c"
+                   "if grep -q '^bad' /dev/stdin; then echo err >&2; exit 1; else cat; fi")))
+    (funcall deriver)
+    (should (equal (with-current-buffer dst (buffer-string)) "good"))
+    (should-not (with-current-buffer dst derivation--error))
+    ;; Make it fail.
+    (with-current-buffer src (erase-buffer) (insert "bad content"))
+    (funcall deriver)
+    (should (with-current-buffer dst derivation--error))
+    (should (equal (with-current-buffer dst (buffer-string)) "good"))
+    ;; Fix it.
+    (with-current-buffer src (erase-buffer) (insert "good again"))
+    (funcall deriver)
+    (should (equal (with-current-buffer dst (buffer-string)) "good again"))
+    (should-not (with-current-buffer dst derivation--error))
+    (derivation-test--kill-buffers (list bufs))))
+
+(ert-deftest derivation-function-error-keeps-last-good ()
+  "When the Elisp function signals, the last good output is preserved."
+  (let* ((bufs (derivation-test--with-buffers "hello"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (ok-then-fail
+          (let ((called nil))
+            (lambda (c)
+              (if called
+                  (error "function failed")
+                (setq called t)
+                (upcase c)))))
+         (deriver (derivation-make-deriver ok-then-fail src dst)))
+    ;; First call: tick != -1, function succeeds → target gets "HELLO".
+    (funcall deriver)
+    (should (equal (with-current-buffer dst (buffer-string)) "HELLO"))
+    (should-not (with-current-buffer dst derivation--error))
+    ;; Second call: modify source to bump tick, then function errors.
+    (with-current-buffer src (erase-buffer) (insert "hello"))
+    (funcall deriver)
+    (with-current-buffer dst
+      (should (equal (buffer-string) "HELLO"))
+      (should derivation--error)
+      (should (string-match "function failed" derivation--error)))
+    (derivation-test--kill-buffers (list bufs))))
+
+(ert-deftest derivation-run-hooks-isolates-errors ()
+  "One broken deriver does not prevent others from running."
+  (let* ((bufs2 (derivation-test--with-buffers "a"))
+         (src2 (car bufs2))
+         (dst2 (cdr bufs2))
+         (counter 0)
+         (good (derivation-make-deriver
+                (lambda (c) (cl-incf counter) c) src2 dst2))
+         (bad (lambda () (error "broken"))))
+    (let ((derivation--storage (list good bad)))
+      (derivation-run-hooks)
+      (should (> counter 0)))
+    (derivation-test--kill-buffers (list bufs2))))
+
+;;; Non-ASCII tests
+
+(ert-deftest derivation-non-ascii-roundtrip ()
+  "Non-ASCII text round-trips through an external command correctly."
+  (skip-unless (executable-find "cat"))
+  (let* ((bufs (derivation-test--with-buffers "héllo wörld ★"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-deriver "cat" src dst)))
+    (funcall deriver)
+    (with-current-buffer dst
+      (should (equal (buffer-string) "héllo wörld ★")))
+    (derivation-test--kill-buffers (list bufs))))
+
+;;; GC survival tests
+
+(ert-deftest derivation-memo-survives-gc ()
+  "Memoization cache is not wiped by garbage collection."
+  (skip-unless (executable-find "cat"))
+  (let* ((bufs (derivation-test--with-buffers "v1"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-deriver "cat" src dst)))
+    (funcall deriver)
+    (should (equal (with-current-buffer dst (buffer-string)) "v1"))
+    ;; Tamper target.
+    (with-current-buffer dst (erase-buffer) (insert "tampered"))
+    ;; Force several GC cycles.
+    (garbage-collect)
+    (garbage-collect)
+    (funcall deriver)
+    ;; Memoization should still hold: tick hasn't changed, no overwrite.
+    (should (equal (with-current-buffer dst (buffer-string)) "tampered"))
+    (derivation-test--kill-buffers (list bufs))))
+
+;;; Dead buffer tests
+
+(ert-deftest derivation-dead-source-buffer ()
+  "Deriver becomes a no-op when its source buffer is killed."
+  (skip-unless (executable-find "cat"))
+  (let* ((bufs (derivation-test--with-buffers "x"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-deriver "cat" src dst)))
+    (funcall deriver)
+    (should (equal (with-current-buffer dst (buffer-string)) "x"))
+    (kill-buffer src)
+    ;; Should not signal — buffer-live-p check returns nil.
+    (funcall deriver)
+    (should (equal (with-current-buffer dst (buffer-string)) "x"))
+    (kill-buffer dst)))
+
+(ert-deftest derivation-dead-target-buffer ()
+  "Deriver becomes a no-op when its target buffer is killed."
+  (let* ((bufs (derivation-test--with-buffers "x"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-deriver #'upcase src dst)))
+    (funcall deriver)
+    (should (equal (with-current-buffer dst (buffer-string)) "X"))
+    (kill-buffer dst)
+    (funcall deriver)
+    (kill-buffer src)))
+
+(ert-deftest derivation-dead-buffers-in-run-hooks ()
+  "derivation-run-hooks handles dead source buffers gracefully."
+  (skip-unless (executable-find "cat"))
+  (let* ((bufs (derivation-test--with-buffers "x"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-deriver "cat" src dst))
+         (bufs2 (derivation-test--with-buffers "a"))
+         (src2 (car bufs2))
+         (dst2 (cdr bufs2))
+         (counter 0)
+         (always-works
+          (derivation-make-deriver
+           (lambda (c) (cl-incf counter) c) src2 dst2)))
+    (kill-buffer src)
+    (kill-buffer dst)
+    (let ((derivation--storage (list deriver always-works)))
+      (derivation-run-hooks)
+      (should (> counter 0)))
+    (derivation-test--kill-buffers (list bufs2))))
+
+;;; Section filter tests
+
+(ert-deftest derivation-section-filter ()
+  "derivation-make-section-filter copies matching section text.
+Without magit loaded, falls back to copying the whole buffer."
+  (let* ((bufs (derivation-test--with-buffers "line1\nline2\nline3"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-section-filter
+                   (lambda (_) t) src dst)))
+    (funcall deriver)
+    (with-current-buffer dst
+      (should (equal (buffer-string) "line1\nline2\nline3"))
+      (should derivation--source))
+    (derivation-test--kill-buffers (list bufs))))
+
+(ert-deftest derivation-section-filter-memoized ()
+  "Section filter is memoized on source buffer tick."
+  (let* ((bufs (derivation-test--with-buffers "initial"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-section-filter
+                   (lambda (_) t) src dst)))
+    (funcall deriver)
+    (should (equal (with-current-buffer dst (buffer-string)) "initial"))
+    (with-current-buffer dst (erase-buffer) (insert "tampered"))
+    (funcall deriver)
+    (should (equal (with-current-buffer dst (buffer-string)) "tampered"))
+    (with-current-buffer src (erase-buffer) (insert "changed"))
+    (funcall deriver)
+    (should (equal (with-current-buffer dst (buffer-string)) "changed"))
+    (derivation-test--kill-buffers (list bufs))))
+
 ;;; Variable derivation tests
 
-;; Declare test variables as dynamic so make-var-deriver can resolve
-;; them via `symbol-value' and `set'.
 (defvar derivation-test--foo)
 (defvar derivation-test--baz)
 
@@ -236,7 +431,7 @@
   "Variable derivation: `baz' derives from `foo' via `length'."
   (let ((derivation-test--foo (list 1 2 3))
         derivation-test--baz)
-    (let ((deriver (make-var-deriver #'length 'derivation-test--foo
+    (let ((deriver (derivation-make-var-deriver #'length 'derivation-test--foo
                                      'derivation-test--baz)))
       (funcall deriver)
       (should (equal derivation-test--baz
@@ -246,11 +441,10 @@
   "Variable derivation is memoized when source hasn't changed."
   (let ((derivation-test--foo (list 1 2 3))
         derivation-test--baz)
-    (let ((deriver (make-var-deriver #'length 'derivation-test--foo
+    (let ((deriver (derivation-make-var-deriver #'length 'derivation-test--foo
                                      'derivation-test--baz)))
       (funcall deriver)
       (should (equal derivation-test--baz 3))
-      ;; Tamper with target — memoization should prevent overwrite.
       (setq derivation-test--baz 99)
       (funcall deriver)
       (should (equal derivation-test--baz 99)))))
@@ -259,11 +453,10 @@
   "Variable derivation recomputes when source variable changes."
   (let ((derivation-test--foo (list 1 2 3))
         derivation-test--baz)
-    (let ((deriver (make-var-deriver #'length 'derivation-test--foo
+    (let ((deriver (derivation-make-var-deriver #'length 'derivation-test--foo
                                      'derivation-test--baz)))
       (funcall deriver)
       (should (equal derivation-test--baz 3))
-      ;; Change source — should recompute.
       (setq derivation-test--foo (list 1 2 3 4 5))
       (funcall deriver)
       (should (equal derivation-test--baz 5)))))
@@ -276,17 +469,13 @@ so the generation counter stays the same.  The `equal' check detects
 the in-place change and triggers recomputation regardless."
   (let ((derivation-test--foo (list 1 2 3))
         derivation-test--baz)
-    (let ((deriver (make-var-deriver #'length 'derivation-test--foo
+    (let ((deriver (derivation-make-var-deriver #'length 'derivation-test--foo
                                      'derivation-test--baz)))
       (funcall deriver)
       (should (equal derivation-test--baz 3))
-      ;; Mutate in place — no watcher fires for setcar,
-      ;; but equal-check detects the change.
       (setcar derivation-test--foo 42)
       (funcall deriver)
-      ;; Still 3 elements, but derivation recomputed.
       (should (equal derivation-test--baz 3))
-      ;; Now add an element in place.
       (setcdr (last derivation-test--foo) '(4))
       (funcall deriver)
       (should (equal derivation-test--baz 4)))))
@@ -295,7 +484,7 @@ the in-place change and triggers recomputation regardless."
   "Repeated calls without source change don't re-derive."
   (let ((derivation-test--foo (list 1 2 3))
         derivation-test--baz)
-    (let ((deriver (make-var-deriver #'length 'derivation-test--foo
+    (let ((deriver (derivation-make-var-deriver #'length 'derivation-test--foo
                                      'derivation-test--baz)))
       (funcall deriver)
       (dotimes (_ 10)

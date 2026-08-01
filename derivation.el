@@ -106,7 +106,6 @@ commands is captured in a hidden buffer."
   (let* ((buf (if (bufferp frombuf) frombuf (get-buffer frombuf)))
          (tbuf (if (bufferp tobuf) tobuf (get-buffer tobuf)))
          (last-tick -1)
-         (last-good nil)
          (errbuf (generate-new-buffer
                   (format " *derivation-err-%s*" (gensym))))
          inner)
@@ -152,7 +151,6 @@ commands is captured in a hidden buffer."
                               (type-of command))))))
               (pcase result
                 (`(ok . ,text)
-                 (setq last-good text)
                  (with-current-buffer tbuf
                    (with-silent-modifications
                      (erase-buffer)
@@ -190,9 +188,7 @@ watching this symbol; when it reaches zero, the watcher is removed.")
   "Increment the generation counter for SYMBOL.
 Installed as a variable watcher.  _OP is the change operation
 \(set, makunbound, let)."
-  (let ((entry (gethash symbol derivation--var-watch-table)))
-    (when entry
-      (cl-incf (car entry)))))
+  (cl-incf (car (gethash symbol derivation--var-watch-table))))
 
 ;;;###autoload
 (defun derivation-make-var-deriver (func fromvar tovar)
@@ -235,8 +231,7 @@ other derivers reference it)."
     (setq deriver
           (lambda ()
             (ignore finalizer-token)
-            (let ((cur-gen (car (gethash fromvar derivation--var-watch-table
-                                         '(0 . 0))))
+            (let ((cur-gen (car (gethash fromvar derivation--var-watch-table)))
                   (cur-val (symbol-value fromvar)))
               (when (or (/= cur-gen last-gen)
                         (not (equal cur-val last-value)))
@@ -247,7 +242,7 @@ other derivers reference it)."
 
 ;;; Generic tree walk
 
-(cl-defgeneric derivation--node-children (_node)
+(cl-defgeneric derivation--node-children (node)
   "Return the children of NODE as a list, or nil.
 
 The default method handles EIEIO objects that have a `children'
@@ -255,21 +250,25 @@ slot.  Additional methods can be defined for hash tables, alists,
 lists, vectors, etc. — enabling new deriver types (map-filter,
 seq-filter, etc.) without changing the tree walker."
   (when (and (fboundp 'eieio-object-p)
-             (eieio-object-p _node)
-             (with-no-warnings (slot-exists-p _node 'children)))
-    (with-no-warnings (slot-value _node 'children))))
+             (eieio-object-p node)
+             (with-no-warnings (slot-exists-p node 'children)))
+    (with-no-warnings (slot-value node 'children))))
 
-(defun derivation--walk-tree (root predicate)
+(defun derivation--walk-tree (root predicate &optional skip-root)
   "Traverse tree from ROOT, collecting nodes matching PREDICATE.
 Uses `derivation--node-children' to recurse into each node.
-Returns matching nodes in preorder."
+Returns matching nodes in preorder.  When SKIP-ROOT is non-nil,
+PREDICATE is not applied to ROOT itself, only to its descendants."
   (let ((results nil))
     (cl-labels ((walk (node)
                   (when (funcall predicate node)
                     (push node results))
                   (dolist (child (derivation--node-children node))
                     (walk child))))
-      (walk root))
+      (if skip-root
+          (dolist (child (derivation--node-children root))
+            (walk child))
+        (walk root)))
     (nreverse results)))
 
 ;;; Section filter derivation
@@ -320,7 +319,7 @@ Example that filters magit-process to show only failed commands:
                             (with-no-warnings
                               (buffer-substring (slot-value section 'start)
                                                 (slot-value section 'end))))
-                          (derivation--walk-tree magit-root-section predicate)
+                          (derivation--walk-tree magit-root-section predicate t)
                           "\n")
                        (buffer-string)))))
               (with-current-buffer tbuf
@@ -347,6 +346,13 @@ The inner function bypasses the tick cache, used by `derivation-rerun'.")
 Value is the error message string.  Used by `derivation-mode-line'
 to show an error indicator.")
 
+(defvar derivation--mode-line-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [mode-line mouse-1] #'derivation-jump-to-source)
+    map)
+  "Keymap for the `derivation-mode-line' indicator.
+Clicking the indicator jumps to the source buffer.")
+
 (defvar derivation-mode-line
   '(:eval (when derivation--source
             (if derivation--error
@@ -357,19 +363,13 @@ to show an error indicator.")
                                                 (car derivation--source))
                                                derivation--error)
                             'mouse-face 'mode-line-highlight
-                            'local-map (let ((map (make-sparse-keymap)))
-                                         (define-key map [mode-line mouse-1]
-                                                     #'derivation-jump-to-source)
-                                         map))
+                            'local-map derivation--mode-line-map)
               (propertize " ⟳"
                           'help-echo (format "derived from %s"
                                              (buffer-name
                                               (car derivation--source)))
                           'mouse-face 'mode-line-highlight
-                          'local-map (let ((map (make-sparse-keymap)))
-                                       (define-key map [mode-line mouse-1]
-                                                   #'derivation-jump-to-source)
-                                       map)))))
+                          'local-map derivation--mode-line-map))))
   "Mode-line construct showing derivation status.
 Add to `mode-line-format' to see which buffers are derived.
 Shows \"⟳\" normally, \"⟳!\" in error face when the last run failed.
@@ -389,6 +389,7 @@ Click to jump to the source buffer.")
       (switch-to-buffer (car derivation--source))
     (user-error "Buffer is not a derivation target")))
 
+;;;###autoload
 (defun derivation-run-hooks ()
   "Run all derivers in `derivation--storage'.
 Intended to be called from an idle timer or manually.

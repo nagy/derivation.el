@@ -422,6 +422,26 @@ Without magit loaded, falls back to copying the whole buffer."
     (should (equal (with-current-buffer dst (buffer-string)) "changed"))
     (derivation-test--kill-buffers (list bufs))))
 
+(ert-deftest derivation--walk-tree-skips-root-when-asked ()
+  "`derivation--walk-tree' with SKIP-ROOT non-nil skips the root node.
+
+Regression test for the section-filter fix: a predicate matching the
+root must not duplicate the whole buffer text."
+  (cl-defstruct (derivation-test--node (:constructor derivation-test--mknode
+                                                     (start end children)))
+    start end children)
+  (cl-defmethod derivation--node-children ((node derivation-test--node))
+    (derivation-test--node-children node))
+  (let* ((leaf (derivation-test--mknode 7 9 nil))
+         (mid (derivation-test--mknode 6 20 (list leaf)))
+         (root (derivation-test--mknode 1 100 (list mid))))
+    (should (equal (mapcar #'derivation-test--node-start
+                           (derivation--walk-tree root (lambda (_) t) t))
+                   '(6 7)))
+    (should (equal (mapcar #'derivation-test--node-start
+                           (derivation--walk-tree root (lambda (_) t)))
+                   '(1 6 7)))))
+
 ;;; Variable derivation tests
 
 (defvar derivation-test--foo)

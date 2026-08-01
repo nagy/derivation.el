@@ -13,11 +13,11 @@
 ## Conventions
 
 - `derivation-make-deriver` takes `(command frombuf tobuf &rest args)`. `command` is a string (external program) or function. Extra `args` are passed to the external command.
-- `derivation-make-var-deriver` takes `(func fromvar tovar)`. `func` is called with the value of `fromvar`. The result is assigned to `tovar` via `set`. Cleanup via `make-finalizer`.
+- `derivation-make-var-deriver` takes `(func fromvar tovar)`. `func` is called with the value of `fromvar`. The result is assigned to `tovar` via `set`. Auto-registered via `derivation-register` (no buffer lifecycle).
 - `derivation-make-section-filter` takes `(predicate frombuf tobuf)`. `predicate` is called with each child of `magit-root-section` in `frombuf`; matching section text is copied to `tobuf`. Uses `slot-value` + `with-no-warnings` to avoid a hard magit-section compile-time dependency.
 - `derivation--node-children` is a `cl-defgeneric` dispatching tree traversal. New deriver types (map.el, seq.el) add `cl-defmethod`s here without changing the walker.
 - Memoization is a single `last-tick` slot per deriver closure (no hash table, no GC fragility). Buffer derivers and section filters key on `buffer-chars-modified-tick`. Variable derivers use a hybrid of variable watcher generation counter + `equal` value comparison with `(copy-tree cur-val t)` for in-place mutation detection.
-- Derivations stored in `derivation--storage` list; run via `derivation-run-hooks`. Errors are isolated per-deriver (one broken deriver does not abort others).
+- Derivations registered via `derivation-register` (constructors self-register); stored in `derivation--storage` records `(DERIVER . CLEANUP-FN)`; run via `derivation-run-hooks` to a fixpoint. Errors are isolated per-deriver (one broken deriver does not abort others). Buffer derivers auto-unregister when their source or target buffer is killed via a buffer-local `kill-buffer-hook`.
 - Tests use temporary buffers, skip on missing executables.
 
 ## Error handling
@@ -29,10 +29,8 @@
 ## Known limitations (current session)
 
 - Buffer source derivers poll via idle timer. Long-running commands block Emacs (sync `call-process-region`).
-- Pipelines (A→B→C) need N idle cycles to fully converge because `last-tick` per deriver means each stage advances one tick per run.
 - In-place mutations on vectors and hash tables are not caught by `equal` (vectors are handled by `copy-tree cur-val t`; hash tables are not).
-- `kill-buffer-hook` cleanup not implemented — dead buffers are handled by `buffer-live-p` checks, but derivers for dead buffers stay in `derivation--storage` forever.
-- `derivation--storage` is a double-dash private var but is the documented public entry point. Rename to `derivation-storage` (or better: provide `derivation-register`/`derivation-unregister`).
+- `derivation--storage` is a double-dash private var; the public API is `derivation-register`/`derivation-unregister`.  Rename the var to `derivation-storage` eventually.
 
 ## Namespace migration TODO
 

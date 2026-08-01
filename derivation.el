@@ -34,32 +34,27 @@
 ;;   (require 'derivation)
 ;;
 ;;   ;; Derive *json-out* from foo.json by running `jq` on every change.
-;;   (setq derivation--storage
-;;         (list
-;;          (derivation-make-deriver
-;;           "jq"                               ; command
-;;           (get-buffer-create "foo.json")      ; source
-;;           (get-buffer-create "*json-out*")    ; target
-;;           "."                                 ; extra args to jq
-;;           "-C")))
+;;   (derivation-register (derivation-make-deriver
+;;          "jq"                               ; command
+;;          (get-buffer-create "foo.json")      ; source
+;;          (get-buffer-create "*json-out*")    ; target
+;;          "."                                 ; extra args to jq
+;;          "-C"))
 ;;
 ;;   ;; Derive *yaml-out* from *json-out* (a pipeline of two buffers).
-;;   (push (derivation-make-deriver
+;;   (derivation-register (derivation-make-deriver
 ;;          "yq"
 ;;          (get-buffer-create "*json-out*")
 ;;          (get-buffer-create "*yaml-out*")
-;;          "-p" "json" "-o" "yaml")
-;;         derivation--storage)
+;;          "-p" "json" "-o" "yaml"))
 ;;
 ;;   ;; Derive *baz* from *foo* via `base64-encode-string'.
-;;   (push (derivation-make-deriver
+;;   (derivation-register (derivation-make-deriver
 ;;          #'base64-encode-string
 ;;          (get-buffer-create "*foo*")
-;;          (get-buffer-create "*baz*"))
-;;         derivation--storage)
+;;          (get-buffer-create "*baz*")))
 ;;   ;; Derive variable `baz' from `foo' via `length'.
-;;   (push (derivation-make-var-deriver #'length 'foo 'baz)
-;;         derivation--storage)
+;;   (derivation-register (derivation-make-var-deriver #'length 'foo 'baz))
 ;;
 ;;   ;; Run derivations on idle.
 ;;   (run-with-idle-timer 0.1 t #'derivation-run-hooks)
@@ -78,9 +73,61 @@
 (require 'cl-lib)
 
 (defvar derivation--storage nil
-  "List of deriver functions to run via `derivation-run-hooks'.
-Each element should be a function returned by `derivation-make-deriver' or
-`derivation-make-var-deriver'.")
+  "List of (DERIVER . CLEANUP-FN) records, in registration order.
+DERIVER is a function returned by `derivation-make-deriver',
+`derivation-make-var-deriver' or `derivation-make-section-filter'.
+CLEANUP-FN, when non-nil, uninstalls the deriver's kill-buffer hooks;
+it is called by `derivation-unregister'.
+
+Never manipulate this list directly: use `derivation-register' and
+`derivation-unregister'.")
+
+(defun derivation-register (deriver &optional cleanup)
+  "Register DERIVER so `derivation-run-hooks' runs it.
+
+CLEANUP is a function that uninstalls DERIVER's kill-buffer hooks
+(see `derivation--register-kill-hooks').  It is optional for derivers
+with no buffer lifecycle (e.g. variable derivers).
+
+Returns DERIVER."
+  (unless (functionp deriver)
+    (error "derivation-register: DERIVER must be a function, got %S" deriver))
+  (push (cons deriver cleanup) derivation--storage)
+  deriver)
+
+(defun derivation-unregister (deriver)
+  "Remove DERIVER from `derivation--storage'.
+Deriver records are also removed automatically when their source or
+target buffer is killed; this is for manual teardown.
+
+Returns non-nil if DERIVER was registered."
+  (let ((removed (assq deriver derivation--storage)))
+    (when removed
+      (setq derivation--storage (delq removed derivation--storage))
+      (when (cdr removed)
+        (funcall (cdr removed))))
+    removed))
+
+(defun derivation--register-kill-hooks (deriver bufs)
+  "Install a buffer-local `kill-buffer-hook' in each live buffer of BUFS.
+The hook removes DERIVER's record from `derivation--storage' when the
+buffer is killed (kill-buffer runs the hook with the buffer current, so
+a buffer-local hook fires directly).  Returns a cleanup function that
+uninstalls the hooks."
+  (let ((hook
+         (lambda ()
+           (setq derivation--storage
+                 (delete (assq deriver derivation--storage)
+                         derivation--storage)))))
+    (dolist (buf bufs)
+      (when (buffer-live-p buf)
+        (with-current-buffer buf
+          (add-hook 'kill-buffer-hook hook nil t))))
+    (lambda ()
+      (dolist (buf bufs)
+        (when (buffer-live-p buf)
+          (with-current-buffer buf
+            (remove-hook 'kill-buffer-hook hook t)))))))
 
 ;;;###autoload
 (defun derivation-make-deriver (command frombuf tobuf &rest args)
@@ -166,15 +213,20 @@ commands is captured in a hidden buffer."
                  (with-current-buffer tbuf
                    (setq-local derivation--error msg))))
               t)))
-    (with-current-buffer tbuf
-      (setq-local derivation--source (cons buf inner)))
-    ;; Return the caching wrapper: dirty-check then maybe call inner.
-    (lambda ()
-      (when (and (buffer-live-p buf) (buffer-live-p tbuf))
-        (let ((tick (buffer-chars-modified-tick buf)))
-          (unless (= tick last-tick)
-            (setq last-tick tick)
-            (funcall inner)))))))
+    (let* ((deriver
+            ;; Return the caching wrapper: dirty-check then maybe call inner.
+            (lambda ()
+              (when (and (buffer-live-p buf) (buffer-live-p tbuf))
+                (let ((tick (buffer-chars-modified-tick buf)))
+                  (unless (= tick last-tick)
+                    (setq last-tick tick)
+                    (funcall inner))))))
+           (cleanup
+            (derivation--register-kill-hooks deriver (list buf tbuf))))
+      (with-current-buffer tbuf
+        (setq-local derivation--source (cons buf inner)))
+      (derivation-register deriver cleanup)
+      deriver)))
 
 ;;; Variable derivation
 
@@ -198,30 +250,15 @@ FUNC is called with the value of FROMVAR as its sole argument.
 The return value is assigned to TOVAR via `set'.
 
 The returned function takes no arguments and is compatible with
-`derivation-run-hooks': just push it onto `derivation--storage'.
+`derivation-run-hooks': it is automatically registered, and can be
+removed with `derivation-unregister'.
 
 Memoization is hybrid: a variable watcher provides a fast \"not
 dirty\" check, and an `equal' value comparison catches in-place
-mutations that the watcher would miss.
-
-When the returned deriver function is garbage-collected, the
-variable watcher on FROMVAR is automatically removed (once no
-other derivers reference it)."
+mutations that the watcher would miss."
   (let* ((entry (gethash fromvar derivation--var-watch-table))
          (last-gen -1)
          (last-value nil)
-         (cleanup
-          (lambda ()
-            (let ((entry (gethash fromvar derivation--var-watch-table)))
-              (when entry
-                (cl-decf (cdr entry))
-                (when (zerop (cdr entry))
-                  (remove-variable-watcher fromvar #'derivation--var-bump)
-                  (remhash fromvar derivation--var-watch-table))))))
-         ;; make-finalizer returns a token whose GC triggers cleanup.
-         ;; We capture the token in deriver's closure so it lives
-         ;; exactly as long as deriver does.
-         (finalizer-token (make-finalizer cleanup))
          (deriver nil))
     ;; Install or bump refcount.
     (if entry
@@ -230,7 +267,6 @@ other derivers reference it)."
       (add-variable-watcher fromvar #'derivation--var-bump))
     (setq deriver
           (lambda ()
-            (ignore finalizer-token)
             (let ((cur-gen (car (gethash fromvar derivation--var-watch-table)))
                   (cur-val (symbol-value fromvar)))
               (when (or (/= cur-gen last-gen)
@@ -238,6 +274,7 @@ other derivers reference it)."
                 (setq last-gen cur-gen
                       last-value (copy-tree cur-val t))
                 (set tovar (funcall func cur-val))))))
+    (derivation-register deriver)
     deriver))
 
 ;;; Generic tree walk
@@ -284,21 +321,22 @@ non-nil have their buffer text (including text properties)
 copied to TOBUF, separated by newlines.
 
 The returned function takes no arguments and is compatible with
-`derivation-run-hooks': just push it onto `derivation--storage'.
+`derivation-run-hooks': it is automatically registered, and can be
+removed with `derivation-unregister'.  The deriver is unregistered
+automatically when FROMBUF or TOBUF is killed.
 
 Memoization is keyed on FROMBUF's buffer-chars-modified-tick.
 
 Example that filters magit-process to show only failed commands:
 
-  (push (derivation-make-section-filter
+  (derivation-register (derivation-make-section-filter
          (lambda (section)
            (let ((proc (slot-value section \\='value)))
              (and (processp proc)
                   (numberp (process-exit-status proc))
                   (/= 0 (process-exit-status proc)))))
          (magit-process-buffer t)
-         (get-buffer-create \"*magit-failures*\"))
-        derivation--storage)"
+         (get-buffer-create \"*magit-failures*\")))"
   (let* ((buf (if (bufferp frombuf) frombuf (get-buffer frombuf)))
          (tbuf (if (bufferp tobuf) tobuf (get-buffer tobuf)))
          (last-tick -1)
@@ -327,14 +365,20 @@ Example that filters magit-process to show only failed commands:
                   (erase-buffer)
                   (insert text)))
               t)))
-    (with-current-buffer tbuf
-      (setq-local derivation--source (cons buf inner)))
-    (lambda ()
-      (when (and (buffer-live-p buf) (buffer-live-p tbuf))
-        (let ((tick (buffer-chars-modified-tick buf)))
-          (unless (= tick last-tick)
-            (setq last-tick tick)
-            (funcall inner)))))))
+    (let* ((deriver
+            ;; Return the caching wrapper: dirty-check then maybe call inner.
+            (lambda ()
+              (when (and (buffer-live-p buf) (buffer-live-p tbuf))
+                (let ((tick (buffer-chars-modified-tick buf)))
+                  (unless (= tick last-tick)
+                    (setq last-tick tick)
+                    (funcall inner))))))
+           (cleanup
+            (derivation--register-kill-hooks deriver (list buf tbuf))))
+      (with-current-buffer tbuf
+        (setq-local derivation--source (cons buf inner)))
+      (derivation-register deriver cleanup)
+      deriver)))
 
 (defvar-local derivation--source nil
   "When non-nil, this buffer is a derivation target.
@@ -376,11 +420,25 @@ Shows \"⟳\" normally, \"⟳!\" in error face when the last run failed.
 Click to jump to the source buffer.")
 
 (defun derivation-rerun ()
-  "Re-run the derivation that produced the current buffer."
+  "Re-run the derivation chain that produced the current buffer.
+Walks `derivation--source' transitively: if this target is itself the
+source of another derivation, that one is re-run too, so a pipeline
+converges in a single call.  Re-runs bypass memoization."
   (interactive)
-  (if derivation--source
-      (funcall (cdr derivation--source))
-    (user-error "Buffer is not a derivation target")))
+  (unless derivation--source
+    (user-error "Buffer is not a derivation target"))
+  (let ((chain nil)
+        (buf (current-buffer)))
+    ;; Collect the chain of buffers, current → upstream.
+    (while (and buf (buffer-live-p buf)
+                (not (member buf chain)))
+      (push buf chain)
+      (setq buf (car (buffer-local-value 'derivation--source buf))))
+    ;; Re-run upstream→downstream (reverse of the chain).
+    (dolist (b (reverse chain))
+      (let ((rec (buffer-local-value 'derivation--source b)))
+        (when rec
+          (funcall (cdr rec)))))))
 
 (defun derivation-jump-to-source ()
   "Switch to the source buffer of this derivation target."
@@ -389,19 +447,37 @@ Click to jump to the source buffer.")
       (switch-to-buffer (car derivation--source))
     (user-error "Buffer is not a derivation target")))
 
+(defvar derivation--max-passes 10
+  "Maximum fixpoint iterations per `derivation-run-hooks' call.")
+
 ;;;###autoload
 (defun derivation-run-hooks ()
-  "Run all derivers in `derivation--storage'.
-Intended to be called from an idle timer or manually.
+  "Run all derivers in `derivation--storage' to a fixpoint.
+Intended to be called from an idle timer or manually.  Repeatedly
+runs the derivers until a pass produces no change, so pipelines
+(A→B→C) converge in a single call, not N idle cycles.  Capped at
+`derivation--max-passes' iterations per call.
+
 Errors in individual derivers are caught and reported without
 aborting the remaining derivers."
   (interactive)
-  (dolist (d derivation--storage)
-    (condition-case err
-        (funcall d)
-      (error
-       (message "derivation: error in deriver: %s"
-                (error-message-string err))))))
+  (let ((passes 0))
+    (while (and (< passes derivation--max-passes)
+                (derivation--run-one-pass))
+      (setq passes (1+ passes)))))
+
+(defun derivation--run-one-pass ()
+  "Run all derivers once.  Return non-nil if any deriver changed state."
+  (let ((changed nil)
+        (records (copy-tree derivation--storage)))
+    (dolist (rec records)
+      (condition-case err
+          (when (funcall (car rec))
+            (setq changed t))
+        (error
+         (message "derivation: error in deriver: %s"
+                  (error-message-string err)))))
+    changed))
 
 (provide 'derivation)
 ;;; derivation.el ends here

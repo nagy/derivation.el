@@ -299,7 +299,7 @@
          (good (derivation-make-deriver
                 (lambda (c) (cl-incf counter) c) src2 dst2))
          (bad (lambda () (error "broken"))))
-    (let ((derivation--storage (list good bad)))
+    (let ((derivation--storage (list (cons good nil) (cons bad nil))))
       (derivation-run-hooks)
       (should (> counter 0)))
     (derivation-test--kill-buffers (list bufs2))))
@@ -384,10 +384,93 @@
            (lambda (c) (cl-incf counter) c) src2 dst2)))
     (kill-buffer src)
     (kill-buffer dst)
-    (let ((derivation--storage (list deriver always-works)))
+    (let ((derivation--storage (list (cons deriver nil)
+                                     (cons always-works nil))))
       (derivation-run-hooks)
       (should (> counter 0)))
     (derivation-test--kill-buffers (list bufs2))))
+
+;;; Lifecycle / register-unregister tests
+
+(ert-deftest derivation-register-unregister ()
+  "derivation-register / derivation-unregister add and remove records."
+  (let ((deriver (lambda () t)))
+    (derivation-register deriver)
+    (should (assq deriver derivation--storage))
+    (should (derivation-unregister deriver))
+    (should-not (assq deriver derivation--storage))
+    (should-not (derivation-unregister deriver))))
+
+(ert-deftest derivation-auto-unregister-on-kill ()
+  "Killing a source or target buffer removes the deriver record."
+  (let* ((bufs (derivation-test--with-buffers "hello"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-deriver #'upcase src dst)))
+    (funcall deriver)
+    (should (assq deriver derivation--storage))
+    (kill-buffer src)
+    (should-not (assq deriver derivation--storage))
+    (kill-buffer dst)))
+
+(ert-deftest derivation-auto-unregister-on-target-kill ()
+  "Killing the target buffer also removes the deriver record."
+  (let* ((bufs (derivation-test--with-buffers "hello"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-deriver #'upcase src dst)))
+    (funcall deriver)
+    (kill-buffer dst)
+    (should-not (assq deriver derivation--storage))
+    (kill-buffer src)))
+
+(ert-deftest derivation-var-deriver-self-registers ()
+  "Variable derivers are automatically registered."
+  (let ((derivation-test--foo '(1 2 3))
+        derivation-test--baz)
+    (let ((deriver
+           (derivation-make-var-deriver #'length 'derivation-test--foo
+                                        'derivation-test--baz)))
+      (should (assq deriver derivation--storage))
+      (derivation-unregister deriver))))
+
+;;; Pipeline / fixpoint tests
+
+(ert-deftest derivation-pipeline-converges-in-one-call ()
+  "A pipeline converges in a single `derivation-run-hooks' call."
+  (let* ((a (generate-new-buffer " *pipeline-a*"))
+         (b (generate-new-buffer " *pipeline-b*"))
+         (c (generate-new-buffer " *pipeline-c*"))
+         (d1 (derivation-make-deriver #'upcase a b))
+         (d2 (derivation-make-deriver #'downcase b c)))
+    (with-current-buffer a (insert "HeLLo"))
+    (unwind-protect
+        (progn
+          (derivation-run-hooks)
+          (should (equal (with-current-buffer c (buffer-string)) "hello")))
+      (derivation-unregister d1)
+      (derivation-unregister d2)
+      (kill-buffer a) (kill-buffer b) (kill-buffer c))))
+
+;;; Rerun chain tests
+
+(ert-deftest derivation-rerun-runs-whole-chain ()
+  "derivation-rerun re-runs the full upstream chain, not just the last."
+  (let* ((a (generate-new-buffer " *rerun-a*"))
+         (b (generate-new-buffer " *rerun-b*"))
+         (c (generate-new-buffer " *rerun-c*"))
+         (d1 (derivation-make-deriver #'upcase a b))
+         (d2 (derivation-make-deriver #'downcase b c)))
+    (with-current-buffer a (insert "xYz"))
+    (unwind-protect
+        (progn
+          (derivation-run-hooks)
+          (with-current-buffer c (erase-buffer) (insert "tampered"))
+          (with-current-buffer c (derivation-rerun))
+          (should (equal (with-current-buffer c (buffer-string)) "xyz")))
+      (derivation-unregister d1)
+      (derivation-unregister d2)
+      (kill-buffer a) (kill-buffer b) (kill-buffer c))))
 
 ;;; Section filter tests
 

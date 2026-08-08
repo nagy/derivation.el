@@ -207,7 +207,7 @@
         (should (string-match "⟳" result))
         (should (get-text-property 0 'help-echo result))
         (should (eq 'mode-line-highlight
-                  (get-text-property 0 'mouse-face result)))))
+                    (get-text-property 0 'mouse-face result)))))
     (derivation-test--kill-buffers (list bufs))))
 
 (ert-deftest derivation-mode-line-form-nil-when-not-set ()
@@ -593,6 +593,153 @@ the in-place change and triggers recomputation regardless."
       (dotimes (_ 10)
         (funcall deriver)
         (should (equal derivation-test--baz 3))))))
+
+;;; Generic data derivation tests
+
+(ert-deftest derivation-make-pushes-on-change-only ()
+  "The memoized deriver pushes only when the data changed."
+  (let ((data 1) (pushed nil))
+    (let ((deriver (derivation-make
+                    (lambda () data)
+                    (lambda (d) (push d pushed)))))
+      (should (funcall deriver))
+      (should (equal pushed '(1)))
+      (should-not (funcall deriver))            ; unchanged: no push
+      (should (equal pushed '(1)))
+      (setq data 2)
+      (should (funcall deriver))
+      (should (equal pushed '(2 1))))))
+
+(ert-deftest derivation-make-not-auto-registered ()
+  "derivation-make returns a plain function; registration is explicit."
+  (let ((before (length derivation--storage)))
+    (derivation-make (lambda () 1) (lambda (_d) nil))
+    (should (= (length derivation--storage) before))))
+
+(ert-deftest derivation-make-stamp-skips-pull ()
+  "With STAMP-FN the pull is skipped while the stamp is unchanged."
+  (let ((pulls 0) (stamp 1) (pushed nil))
+    (let ((deriver (derivation-make
+                    (lambda () (prog1 (list 'data stamp)
+                                 (setq pulls (1+ pulls))))
+                    (lambda (d) (push d pushed))
+                    (lambda () stamp))))
+      (should (funcall deriver))
+      (should (= pulls 1))
+      (should-not (funcall deriver))            ; stamp unchanged: no pull
+      (should (= pulls 1))
+      (setq stamp 2)
+      (should (funcall deriver))
+      (should (= pulls 2))
+      (should (equal pushed '((data 2) (data 1)))))))
+
+;;; Tabulated list derivation tests
+
+(defun derivation-test--tab-entries ()
+  "Test helper: one tabulated entry."
+  '((a ["A" "1"])))
+
+(ert-deftest derivation-tabulated-basic ()
+  "Creates a populated tabulated-list buffer and registers a deriver."
+  (let* ((before (length derivation--storage))
+         (buf (derivation-make-tabulated
+               (lambda () '((a ["A" "1"]) (b ["B" "2"])))
+               [("Name" 20 t) ("PID" 8 t)]
+               :name " *deriv-test-tab*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (should (derived-mode-p 'tabulated-list-mode))
+            (should (equal tabulated-list-entries
+                           '((a ["A" "1"]) (b ["B" "2"]))))
+            (should (= (count-lines (point-min) (point-max)) 2))
+            (should (string-match-p "^A" (buffer-string))))
+          (should (= (length derivation--storage) (1+ before))))
+      (kill-buffer buf))
+    (should (= (length derivation--storage) before))))
+
+(ert-deftest derivation-tabulated-updates-on-change ()
+  "A changed entries list re-renders; unchanged data does not."
+  (let ((state '((a ["A" "1"]))))
+    (let ((buf (derivation-make-tabulated
+                (lambda () state)
+                [("Name" 20 t)]
+                :name " *deriv-test-tab*")))
+      (unwind-protect
+          (progn
+            (with-current-buffer buf
+              (should (= (count-lines (point-min) (point-max)) 1)))
+            (derivation-run-hooks)
+            (with-current-buffer buf
+              (should (= (count-lines (point-min) (point-max)) 1)))
+            (setq state '((a ["A" "1"]) (b ["B" "2"])))
+            (derivation-run-hooks)
+            (with-current-buffer buf
+              (should (= (count-lines (point-min) (point-max)) 2))))
+        (kill-buffer buf)))))
+
+(ert-deftest derivation-tabulated-unique-names ()
+  "Each call makes a fresh buffer; taken names are uniquified."
+  (let* ((b1 (derivation-make-tabulated (lambda () nil) [("Name" 20 t)]
+                                        :name " *deriv-test-tab*"))
+         (b2 (derivation-make-tabulated (lambda () nil) [("Name" 20 t)]
+                                        :name " *deriv-test-tab*")))
+    (unwind-protect
+        (progn
+          (should-not (eq b1 b2))
+          (should (equal (buffer-name b1) " *deriv-test-tab*"))
+          (should-not (equal (buffer-name b2) (buffer-name b1))))
+      (kill-buffer b1)
+      (kill-buffer b2)))
+  ;; Visible names get the familiar <2> suffix (what the shells demo
+  ;; relies on); space-prefixed names get a random suffix instead.
+  (let* ((b1 (derivation-make-tabulated (lambda () nil) [("Name" 20 t)]
+                                        :name "deriv-test-tab"))
+         (b2 (derivation-make-tabulated (lambda () nil) [("Name" 20 t)]
+                                        :name "deriv-test-tab")))
+    (unwind-protect
+        (should (equal (buffer-name b2) "deriv-test-tab<2>"))
+      (kill-buffer b1)
+      (kill-buffer b2))))
+
+(ert-deftest derivation-tabulated-error-keeps-last-good ()
+  "A failing entries function keeps the last table and sets the error."
+  (let ((fail nil))
+    (let ((buf (derivation-make-tabulated
+                (lambda () (if fail (error "boom") '((a ["A" "1"]))))
+                [("Name" 20 t)]
+                :name " *deriv-test-tab*")))
+      (unwind-protect
+          (progn
+            (with-current-buffer buf
+              (should-not derivation--error)
+              (should (string-match-p "^A" (buffer-string))))
+            (setq fail t)
+            (derivation-run-hooks)
+            (with-current-buffer buf
+              (should derivation--error)
+              (should (string-match-p "^A" (buffer-string))))
+            (setq fail nil)
+            (derivation-run-hooks)
+            (with-current-buffer buf
+              (should-not derivation--error)))
+        (kill-buffer buf)))))
+
+(ert-deftest derivation-tabulated-mode-line-label ()
+  "The mode-line shows the entries function name as the source."
+  (let ((buf (derivation-make-tabulated
+              #'derivation-test--tab-entries
+              [("Name" 20 t)]
+              :name " *deriv-test-tab*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (should (equal (car derivation--source)
+                         "derivation-test--tab-entries"))
+          (should (string-match-p
+                   "derivation-test--tab-entries"
+                   (get-text-property 0 'help-echo
+                                      (eval (cadr derivation-mode-line))))))
+      (kill-buffer buf))))
 
 (provide 'derivation-tests)
 ;;; derivation-tests.el ends here

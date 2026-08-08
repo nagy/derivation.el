@@ -71,6 +71,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'tabulated-list)
 
 (defvar derivation--storage nil
   "List of (DERIVER . CLEANUP-FN) records, in registration order.
@@ -228,6 +229,113 @@ commands is captured in a hidden buffer."
       (derivation-register deriver cleanup)
       deriver)))
 
+;;; Generic data derivation
+
+(defconst derivation--unset (make-symbol "derivation--unset")
+  "Sentinel distinguishing \"never run\" from any real value.")
+
+;;;###autoload
+(defun derivation-make (pull-fn push-fn &optional stamp-fn)
+  "Create a memoized deriver that PULL-FN pulls and PUSH-FN pushes.
+
+PULL-FN is called with no arguments and returns the derived data
+\(typically a pure scan of global state).  PUSH-FN is called with
+the data and must render it into its target; it is responsible for
+selecting the target buffer.
+
+Memoization: the returned deriver pushes only when the data changed
+\(compared with `equal'), and copies the data so in-place mutations
+are caught on the next run.  When STAMP-FN is given, it is called
+before PULL-FN and the pull is skipped entirely while the stamp is
+unchanged — use it when PULL-FN is expensive but cheap to version
+\(a file mtime, a `buffer-chars-modified-tick', a counter bumped by
+a hook).  Without STAMP-FN the deriver polls: every run calls
+PULL-FN and pushes only on a data change.
+
+The returned function takes no arguments and is compatible with
+`derivation-run-hooks'; it is NOT registered automatically — pass it
+to `derivation-register' (or `derivation-unregister') explicitly."
+  (let ((last-stamp derivation--unset)
+        (last-data derivation--unset))
+    (lambda ()
+      (let* ((poll (null stamp-fn))
+             (stamp (unless poll (funcall stamp-fn)))
+             (dirty (or poll
+                        (eq last-stamp derivation--unset)
+                        (not (equal stamp last-stamp)))))
+        (when dirty
+          (setq last-stamp stamp)
+          (let ((data (funcall pull-fn)))
+            (unless (equal data last-data)
+              (setq last-data (copy-tree data t))
+              (funcall push-fn data)
+              t)))))))
+
+;;;###autoload
+(cl-defun derivation-make-tabulated (entries-fn format &key name sort-key)
+  "Create a live `tabulated-list-mode' buffer derived from ENTRIES-FN.
+
+ENTRIES-FN is called with no arguments and must return
+`tabulated-list-entries': a list of (ID [COLS...]).
+
+FORMAT is the `tabulated-list-format' column spec, e.g.
+  [(\"Shell\" 30 t) (\"PID\" 10 my-pid-sorter)].
+NAME is the buffer name, SORT-KEY the initial
+`tabulated-list-sort-key'.
+
+Each call creates a FRESH buffer (the name is uniquified if taken,
+so repeated calls yield \"*shells*\", \"*shells*<2>\", ...) and
+registers a deriver that polls ENTRIES-FN on the
+`derivation-run-hooks' schedule, re-rendering only when the entries
+changed.  The deriver unregisters itself when the buffer is killed.
+Errors in ENTRIES-FN leave the last good table and set
+`derivation--error', shown as \"⟳!\" by `derivation-mode-line'.
+To refresh immediately on an event, wire the event hook to the
+runner, e.g. add `buffer-list-update-hook' to a function that calls
+`derivation-run-hooks'.
+
+Returns the buffer, populated on creation."
+  (unless (functionp entries-fn)
+    (error "derivation-make-tabulated: ENTRIES-FN must be a function"))
+  (let* ((buf (get-buffer-create
+               (generate-new-buffer-name (or name "*derivation*"))))
+         (push-fn
+          (lambda (entries)
+            (with-current-buffer buf
+              (setq tabulated-list-entries entries)
+              (tabulated-list-print t))))
+         (deriver (derivation-make entries-fn push-fn))
+         (guarded
+          (lambda ()
+            (condition-case err
+                (prog1 (funcall deriver)
+                  (when (buffer-live-p buf)
+                    (with-current-buffer buf
+                      (setq-local derivation--error nil))))
+              (error
+               (when (buffer-live-p buf)
+                 (with-current-buffer buf
+                   (setq-local derivation--error (error-message-string err))))
+               nil))))
+         (label (if (symbolp entries-fn)
+                    (symbol-name entries-fn)
+                  (or name (buffer-name buf)))))
+    (with-current-buffer buf
+      (tabulated-list-mode)
+      (setq-local tabulated-list-format format)
+      (when sort-key
+        (setq-local tabulated-list-sort-key sort-key))
+      (tabulated-list-init-header)
+      (setq-local derivation--source
+                  (cons label
+                        (lambda ()
+                          (funcall push-fn (funcall entries-fn))
+                          t))))
+    (derivation-register guarded
+                         (derivation--register-kill-hooks guarded (list buf)))
+    (funcall guarded)
+    buf))
+
 ;;; Variable derivation
 
 (defvar derivation--var-watch-table (make-hash-table :test 'eq)
@@ -382,8 +490,15 @@ Example that filters magit-process to show only failed commands:
 
 (defvar-local derivation--source nil
   "When non-nil, this buffer is a derivation target.
-Value is (SOURCE-BUFFER . INNER-TRANSFORM-FUNCTION).
-The inner function bypasses the tick cache, used by `derivation-rerun'.")
+Value is (SOURCE . INNER-TRANSFORM-FUNCTION).  SOURCE is a buffer
+or a string label (data derivations have no source buffer); it is
+shown by `derivation-mode-line' and used by
+`derivation-jump-to-source'.  The inner function bypasses
+memoization, used by `derivation-rerun'.")
+
+(defun derivation--source-label (source)
+  "Return a display name for SOURCE, a buffer or a string label."
+  (if (bufferp source) (buffer-name source) source))
 
 (defvar-local derivation--error nil
   "When non-nil, the last derivation produced an error.
@@ -403,14 +518,14 @@ Clicking the indicator jumps to the source buffer.")
                 (propertize " ⟳!"
                             'face 'error
                             'help-echo (format "derived from %s (error: %s)"
-                                               (buffer-name
+                                               (derivation--source-label
                                                 (car derivation--source))
                                                derivation--error)
                             'mouse-face 'mode-line-highlight
                             'local-map derivation--mode-line-map)
               (propertize " ⟳"
                           'help-echo (format "derived from %s"
-                                             (buffer-name
+                                             (derivation--source-label
                                               (car derivation--source)))
                           'mouse-face 'mode-line-highlight
                           'local-map derivation--mode-line-map))))
@@ -441,10 +556,14 @@ converges in a single call.  Re-runs bypass memoization."
           (funcall (cdr rec)))))))
 
 (defun derivation-jump-to-source ()
-  "Switch to the source buffer of this derivation target."
+  "Switch to the source buffer of this derivation target.
+For data derivations whose source is a string label, report it."
   (interactive)
   (if derivation--source
-      (switch-to-buffer (car derivation--source))
+      (let ((src (car derivation--source)))
+        (if (bufferp src)
+            (switch-to-buffer src)
+          (message "Source of this derivation is `%s', not a buffer" src)))
     (user-error "Buffer is not a derivation target")))
 
 (defvar derivation--max-passes 10

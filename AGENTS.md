@@ -8,7 +8,7 @@
 
 - `derivation.el` — single-file library, ~400 lines.
 - `derivation-tests.el` — ERT tests.
-- `default.nix` — Nix build for non-interactive batch testing.
+- `flake.nix` — Nix flake for non-interactive batch testing (`nix build` runs the ERT suite; `nix develop` for a shell with Emacs).
 
 ## Conventions
 

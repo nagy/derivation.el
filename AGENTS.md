@@ -23,6 +23,7 @@
 - Buffer derivers (`derivation-make-deriver`, `derivation-make-section-filter`) install `buffer-stale-function` and `revert-buffer-function` buffer-locally in the target via `derivation--install-target-hooks`. This lets the built-in `auto-revert-mode` (or `global-auto-revert-mode` + `global-auto-revert-non-file-buffers`) drive re-derivation instead of the idle timer. Staleness is the cheap tick check; `revert-buffer` runs the inner transform directly (bypassing memoization, like `derivation-rerun`).
 - `derivation--node-children` is a `cl-defgeneric` dispatching tree traversal. New deriver types (map.el, seq.el) add `cl-defmethod`s here without changing the walker.
 - Memoization is a single `last-tick` slot per deriver closure (no hash table, no GC fragility). Buffer derivers and section filters key on `buffer-chars-modified-tick`. Variable derivers gate on `equal` of the value with `(copy-tree cur-val t)` (for in-place mutation detection); the watcher generation is no longer used for the dirty check, so a `let` rebinding to an `equal` value does not recompute.
+- Both sinks write via `derivation--replace-contents`, which uses `replace-region-contents` (Emacs 31+; falls back to `replace-buffer-contents`) so point, markers, and `window-start` survive updates and `after-change-functions` fire (font-lock etc. see the change). It preserves the buffer's modified state rather than using `with-silent-modifications`.
 - Cleanup is deterministic: `derivation-unregister` runs each record's cleanup fn. `derivation--register-kill-hooks` runs the cleanup from the buffer-local `kill-buffer-hook` too (idempotent), so killing a source/target frees the deriver's watcher/hidden buffers. `derivation-make-deriver` allocates its hidden stderr buffer lazily (first failed string command) and kills it on unregister/buffer kill; `derivation-make-var-deriver` decrements the `derivation--var-watch-table` refcount and removes the variable watcher at zero. `derivation--run-one-pass` snapshots `derivation--storage` with `copy-sequence`.
 - Derivations registered via `derivation-register` (constructors self-register); stored in `derivation--storage` records `(DERIVER . CLEANUP-FN)`; run via `derivation-run-hooks` to a fixpoint. Errors are isolated per-deriver (one broken deriver does not abort others). Buffer derivers auto-unregister when their source or target buffer is killed via a buffer-local `kill-buffer-hook`.
 - Tests use temporary buffers, skip on missing executables.
@@ -92,7 +93,7 @@ The `buffer-stale-function` / `revert-buffer-function` integration is the first 
 
 ### replace-buffer-contents
 
-In the sink instead of erase+insert — preserves point, markers, and window scroll in visible preview buffers (the core live-preview scenario).
+Done: both sinks write via `derivation--replace-contents`, which uses `replace-region-contents` (Emacs 31+) with a `replace-buffer-contents` fallback, preserving point, markers, window scroll, and firing `after-change-functions`.
 
 ### Explicit lifecycle
 
@@ -106,14 +107,12 @@ Numbered work items for this project.  **Remove items entirely once finished** (
 
 1. **Drop the `cl-defgeneric` tree walk.** `derivation--node-children` is speculative generality (map.el, seq.el deriver types that don't exist yet) that adds a soft EIEIO dependency and a `with-no-warnings` slot access. Introduce the generic only when a second concrete tree appears.
 
-2. **Sink should use `replace-buffer-contents`.** `with-silent-modifications` + `erase-buffer` + `insert` suppresses `after-change-functions` and makes point/markers/window scroll jump in visible preview buffers. `replace-buffer-contents` preserves point, markers, and window-start (and undo).
-
-3. **Async processes.** `make-process` + sentinel with a generation counter to discard stale results. `call-process-region` freezes the UI on every keystroke-then-idle for slow commands.
+2. **Async processes.** `make-process` + sentinel with a generation counter to discard stale results. `call-process-region` freezes the UI on every keystroke-then-idle for slow commands.
 
 ### Cleanup
 
-4. **Test `derivation-mode-line-form-evaluates` tests implementation, not behavior.** It `eval`s `(cadr derivation-mode-line)` directly. A rendering-based test is impossible in the batch suite: `format-mode-line` is a deliberate no-op when `noninteractive` (see `Fformat_mode_line` in xdisp.c), so the rendered string can't be checked under `emacs --batch`. Either keep the eval-based test or move the suite to a display-backed runner.
+3. **Test `derivation-mode-line-form-evaluates` tests implementation, not behavior.** It `eval`s `(cadr derivation-mode-line)` directly. A rendering-based test is impossible in the batch suite: `format-mode-line` is a deliberate no-op when `noninteractive` (see `Fformat_mode_line` in xdisp.c), so the rendered string can't be checked under `emacs --batch`. Either keep the eval-based test or move the suite to a display-backed runner.
 
-5. **Minor: stderr capture.** `with-temp-buffer` + `insert-file-contents` for stderr could be a single `insert-file-contents` into a reused buffer.
+4. **Minor: stderr capture.** `with-temp-buffer` + `insert-file-contents` for stderr could be a single `insert-file-contents` into a reused buffer.
 
-6. **Migrate the three constructors onto `derivation-make`.** `derivation-make-deriver` (content pipeline), `derivation-make-var-deriver`, and `derivation-make-section-filter` should become thin wrappers around `derivation-make` with the appropriate stamp (buffer tick / watcher generation), replacing three copies of the memoization pattern with the unified one. Each becomes ~5 lines.
+5. **Migrate the three constructors onto `derivation-make`.** `derivation-make-deriver` (content pipeline), `derivation-make-var-deriver`, and `derivation-make-section-filter` should become thin wrappers around `derivation-make` with the appropriate stamp (buffer tick / watcher generation), replacing three copies of the memoization pattern with the unified one. Each becomes ~5 lines.

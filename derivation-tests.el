@@ -49,6 +49,46 @@
       (should (equal (buffer-string) "hello world")))
     (derivation-test--kill-buffers (list bufs))))
 
+(ert-deftest derivation-sink-preserves-point-and-markers ()
+  "Re-deriving keeps point and markers in the target."
+  (let* ((bufs (derivation-test--with-buffers "line1\nline2\nline3\n"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-deriver #'identity src dst)))
+    (funcall deriver)
+    (with-current-buffer dst
+      (set-buffer-modified-p nil)
+      (goto-char 4)
+      (let ((m (copy-marker 8)))
+        ;; A minimal edit elsewhere in the source; point/marker untouched.
+        (with-current-buffer src
+          (goto-char (point-min))
+          (search-forward "line3")
+          (replace-match "LINE3"))
+        (funcall deriver)
+        (should (equal (buffer-string) "line1\nline2\nLINE3\n"))
+        (should (= (point) 4))
+        (should (= (marker-position m) 8))
+        ;; The derivation is not a user edit.
+        (should-not (buffer-modified-p))))
+    (derivation-test--kill-buffers (list bufs))))
+
+(ert-deftest derivation-sink-runs-after-change-functions ()
+  "The target write is visible to `after-change-functions'."
+  (let* ((bufs (derivation-test--with-buffers "a"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-deriver #'identity src dst))
+         (changes 0))
+    (funcall deriver)
+    (with-current-buffer dst
+      (add-hook 'after-change-functions (lambda (&rest _) (setq changes (1+ changes)))
+                nil t))
+    (with-current-buffer src (erase-buffer) (insert "b"))
+    (funcall deriver)
+    (should (> changes 0))
+    (derivation-test--kill-buffers (list bufs))))
+
 (ert-deftest derivation-transformation ()
   "Source content is uppercased via `tr a-z A-Z' into target."
   (skip-unless (executable-find "tr"))

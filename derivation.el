@@ -141,6 +141,30 @@ and safe to call from within the hook itself."
           (with-current-buffer buf
             (remove-hook 'kill-buffer-hook hook t)))))))
 
+(defun derivation--replace-contents (text)
+  "Replace the accessible text of the current buffer with TEXT.
+Unlike `erase-buffer'+`insert', this edits only the differing regions
+via `replace-region-contents' (falling back to
+`replace-buffer-contents' before Emacs 31), so point, markers, and
+`window-start' in visible targets do not jump, undo stays coherent,
+and `after-change-functions' run (font-lock and friends see the
+update).
+
+Mirrors `with-silent-modifications' where it matters: the buffer's
+modified state is preserved (the derivation is not a user edit).
+Read-only is bypassed, as the previous sink did."
+  (let ((inhibit-read-only t)
+        (modified (buffer-modified-p))
+        (src (generate-new-buffer " *derivation-sink*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer src (insert text))
+          (if (fboundp 'replace-region-contents)
+              (replace-region-contents (point-min) (point-max) src)
+            (with-no-warnings (replace-buffer-contents src))))
+      (kill-buffer src))
+    (restore-buffer-modified-p modified)))
+
 ;;;###autoload
 (defun derivation-make-deriver (command frombuf tobuf &rest args)
   "Create a memoized function that derives TOBUF from FROMBUF via COMMAND.
@@ -215,9 +239,7 @@ are set buffer-locally so `auto-revert-mode' (or Global Auto-Revert with
               (pcase result
                 (`(ok . ,text)
                  (with-current-buffer tbuf
-                   (with-silent-modifications
-                     (erase-buffer)
-                     (insert text))
+                   (derivation--replace-contents text)
                    (setq-local derivation--error nil))
                  (when (buffer-live-p errbuf)
                    (with-current-buffer errbuf
@@ -513,9 +535,7 @@ Example that filters magit-process to show only failed commands:
                           "\n")
                        (buffer-string)))))
               (with-current-buffer tbuf
-                (with-silent-modifications
-                  (erase-buffer)
-                  (insert text)))
+                (derivation--replace-contents text))
               t)))
     (let* ((dirtyp
             (lambda ()

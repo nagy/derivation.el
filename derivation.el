@@ -610,13 +610,15 @@ converges in a single call.  Re-runs bypass memoization."
     (user-error "Buffer is not a derivation target"))
   (let ((chain nil)
         (buf (current-buffer)))
-    ;; Collect the chain of buffers, current → upstream.
+    ;; Collect the chain of buffers, current → upstream.  PUSHing while
+    ;; walking upstream leaves CHAIN in upstream → downstream order.
     (while (and buf (buffer-live-p buf)
                 (not (member buf chain)))
       (push buf chain)
       (setq buf (car (buffer-local-value 'derivation--source buf))))
-    ;; Re-run upstream→downstream (reverse of the chain).
-    (dolist (b (reverse chain))
+    ;; CHAIN is already upstream → downstream: run it as-is, so each
+    ;; transform reads a fresh intermediate.
+    (dolist (b chain)
       (let ((rec (buffer-local-value 'derivation--source b)))
         (when rec
           (funcall (cdr rec)))))))

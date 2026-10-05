@@ -608,6 +608,31 @@
       (derivation-unregister d2)
       (kill-buffer a) (kill-buffer b) (kill-buffer c))))
 
+(ert-deftest derivation-rerun-refreshes-stale-intermediate ()
+  "Rerun must refresh a stale intermediate before the downstream target.
+
+Regression test for the `reverse' bug: rerunning at C re-ran the
+C-transform (reading stale B) before the B-transform.  Tampering BOTH
+B and C exposes it; the old test tampered only C and could not."
+  (let* ((a (generate-new-buffer " *rerun-a*"))
+         (b (generate-new-buffer " *rerun-b*"))
+         (c (generate-new-buffer " *rerun-c*"))
+         (d1 (derivation-make-deriver #'upcase   a b))
+         (d2 (derivation-make-deriver #'downcase b c)))
+    (with-current-buffer a (insert "hello"))
+    (unwind-protect
+        (progn
+          (derivation-run-hooks)
+          ;; Tamper the intermediate AND the target.
+          (with-current-buffer b (erase-buffer) (insert "TAMPERED"))
+          (with-current-buffer c (erase-buffer) (insert "TAMPERED"))
+          (with-current-buffer c (derivation-rerun))
+          (should (equal (with-current-buffer b (buffer-string)) "HELLO"))
+          (should (equal (with-current-buffer c (buffer-string)) "hello")))
+      (derivation-unregister d1)
+      (derivation-unregister d2)
+      (kill-buffer a) (kill-buffer b) (kill-buffer c))))
+
 ;;; Section filter tests
 
 (ert-deftest derivation-section-filter ()

@@ -338,19 +338,37 @@
       (derivation-test--kill-buffers (list bufs)))))
 
 (ert-deftest derivation-stderr-buffer-killed-on-unregister ()
-  "Unregistering a deriver kills its hidden stderr buffer."
+  "A failed command's hidden stderr buffer dies on unregister."
   (let* ((bufs (derivation-test--with-buffers "x"))
          (src (car bufs))
          (dst (cdr bufs))
-         (deriver (derivation-make-deriver #'identity src dst))
-         (name (buffer-name
-                (car (seq-filter
-                      (lambda (b) (string-match-p "derivation-err" (buffer-name b)))
-                      (buffer-list))))))
-    (should (get-buffer name))
-    (derivation-unregister deriver)
-    (should-not (get-buffer name))
+         (deriver (derivation-make-deriver
+                   (lambda (_c) (error "boom")) src dst)))
+    ;; No stderr buffer exists until a command fails.
+    (funcall deriver)
+    (let ((name (buffer-name
+                 (car (seq-filter
+                       (lambda (b) (string-match-p "derivation-err" (buffer-name b)))
+                       (buffer-list))))))
+      (should (get-buffer name))
+      (derivation-unregister deriver)
+      (should-not (get-buffer name)))
     (derivation-test--kill-buffers (list bufs))))
+
+(ert-deftest derivation-stderr-buffer-lazy ()
+  "The stderr buffer is not created until a command fails."
+  (let* ((bufs (derivation-test--with-buffers "x"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-deriver #'identity src dst)))
+    (unwind-protect
+        (progn
+          (funcall deriver)
+          (should-not (seq-find
+                       (lambda (b) (string-match-p "derivation-err" (buffer-name b)))
+                       (buffer-list))))
+      (derivation-unregister deriver)
+      (derivation-test--kill-buffers (list bufs)))))
 
 (ert-deftest derivation-var-watcher-removed-on-unregister ()
   "Unregistering the last var deriver removes the variable watcher."
@@ -361,8 +379,11 @@
     (set sym '(1 2 3))
     (let ((deriver (derivation-make-var-deriver #'length sym out)))
       (should (gethash sym derivation--var-watch-table))
+      (should (memq #'derivation--var-bump (get-variable-watchers sym)))
       (derivation-unregister deriver)
-      (should-not (gethash sym derivation--var-watch-table)))))
+      (should-not (gethash sym derivation--var-watch-table))
+      ;; The watcher itself must be gone, not just the table entry.
+      (should-not (memq #'derivation--var-bump (get-variable-watchers sym))))))
 
 (ert-deftest derivation-var-watcher-refcount ()
   "Two derivers on the same source keep the watcher until both go."
@@ -373,8 +394,10 @@
           (d2 (derivation-make-var-deriver #'identity sym out)))
       (derivation-unregister d1)
       (should (gethash sym derivation--var-watch-table))
+      (should (memq #'derivation--var-bump (get-variable-watchers sym)))
       (derivation-unregister d2)
-      (should-not (gethash sym derivation--var-watch-table)))))
+      (should-not (gethash sym derivation--var-watch-table))
+      (should-not (memq #'derivation--var-bump (get-variable-watchers sym))))))
 
 (ert-deftest derivation-failure-recovers ()
   "After a failure, fixing the source restores the derivation."
@@ -743,6 +766,26 @@ the in-place change and triggers recomputation regardless."
       (setcdr (last derivation-test--foo) '(4))
       (funcall deriver)
       (should (equal derivation-test--baz 4)))))
+
+(ert-deftest derivation-var-let-rebind-equal-no-recompute ()
+  "A `let' rebinding to an `equal' value does not recompute."
+  (let ((derivation-test--foo (list 1 2 3))
+        (calls 0)
+        derivation-test--baz)
+    (let ((deriver (derivation-make-var-deriver
+                    (lambda (v) (cl-incf calls) (length v))
+                    'derivation-test--foo 'derivation-test--baz)))
+      (funcall deriver)
+      (should (= calls 1))
+      ;; `let'-binding the source to an `equal' value fires the watcher
+      ;; (generation bump) but must not rerun.
+      (let ((derivation-test--foo (list 1 2 3)))
+        (funcall deriver))
+      (should (= calls 1))
+      ;; A real change still recomputes.
+      (setq derivation-test--foo (list 1 2 3 4))
+      (funcall deriver)
+      (should (= calls 2)))))
 
 (ert-deftest derivation-var-multiple-calls ()
   "Repeated calls without source change don't re-derive."

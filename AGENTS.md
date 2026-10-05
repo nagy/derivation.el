@@ -22,8 +22,8 @@
 - `derivation-rerun` collects the upstream chain by `push`-ing while walking current → upstream, so the list is already upstream → downstream; it iterates it directly (no `reverse`). Running downstream-first would let a target transform read a stale intermediate. `derivation-run-hooks` converges via its fixpoint loop instead.
 - Buffer derivers (`derivation-make-deriver`, `derivation-make-section-filter`) install `buffer-stale-function` and `revert-buffer-function` buffer-locally in the target via `derivation--install-target-hooks`. This lets the built-in `auto-revert-mode` (or `global-auto-revert-mode` + `global-auto-revert-non-file-buffers`) drive re-derivation instead of the idle timer. Staleness is the cheap tick check; `revert-buffer` runs the inner transform directly (bypassing memoization, like `derivation-rerun`).
 - `derivation--node-children` is a `cl-defgeneric` dispatching tree traversal. New deriver types (map.el, seq.el) add `cl-defmethod`s here without changing the walker.
-- Memoization is a single `last-tick` slot per deriver closure (no hash table, no GC fragility). Buffer derivers and section filters key on `buffer-chars-modified-tick`. Variable derivers use a hybrid of variable watcher generation counter + `equal` value comparison with `(copy-tree cur-val t)` for in-place mutation detection.
-- Cleanup is deterministic: `derivation-unregister` runs each record's cleanup fn. `derivation--register-kill-hooks` now runs the cleanup from the buffer-local `kill-buffer-hook` too (idempotent), so killing a source/target frees the deriver's watcher/hidden buffers. `derivation-make-deriver` kills its stderr buffer; `derivation-make-var-deriver` decrements the `derivation--var-watch-table` refcount and removes the variable watcher at zero.
+- Memoization is a single `last-tick` slot per deriver closure (no hash table, no GC fragility). Buffer derivers and section filters key on `buffer-chars-modified-tick`. Variable derivers gate on `equal` of the value with `(copy-tree cur-val t)` (for in-place mutation detection); the watcher generation is no longer used for the dirty check, so a `let` rebinding to an `equal` value does not recompute.
+- Cleanup is deterministic: `derivation-unregister` runs each record's cleanup fn. `derivation--register-kill-hooks` runs the cleanup from the buffer-local `kill-buffer-hook` too (idempotent), so killing a source/target frees the deriver's watcher/hidden buffers. `derivation-make-deriver` allocates its hidden stderr buffer lazily (first failed string command) and kills it on unregister/buffer kill; `derivation-make-var-deriver` decrements the `derivation--var-watch-table` refcount and removes the variable watcher at zero. `derivation--run-one-pass` snapshots `derivation--storage` with `copy-sequence`.
 - Derivations registered via `derivation-register` (constructors self-register); stored in `derivation--storage` records `(DERIVER . CLEANUP-FN)`; run via `derivation-run-hooks` to a fixpoint. Errors are isolated per-deriver (one broken deriver does not abort others). Buffer derivers auto-unregister when their source or target buffer is killed via a buffer-local `kill-buffer-hook`.
 - Tests use temporary buffers, skip on missing executables.
 
@@ -40,9 +40,11 @@
 - In-place mutations on vectors and hash tables are not caught by `equal` (vectors are handled by `copy-tree cur-val t`; hash tables are not).
 - `derivation--storage` is a double-dash private var; the public API is `derivation-register`/`derivation-unregister`.  Rename the var to `derivation-storage` eventually.
 
-## Namespace migration TODO
+## Namespace migration (done)
 
-Old names (still present as aliases needed by existing users):
+The rename from the old `make-*` names landed in the pre-0.1 history
+(commit `69b2dcf`); the old names are gone:
+
 - `make-deriver` → `derivation-make-deriver`
 - `make-var-deriver` → `derivation-make-var-deriver`
 - `make-section-filter` → `derivation-make-section-filter`

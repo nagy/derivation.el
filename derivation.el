@@ -81,7 +81,7 @@
 (require 'tabulated-list)
 
 (defvar derivation--storage nil
-  "List of (DERIVER . CLEANUP-FN) records, in registration order.
+  "List of (DERIVER . CLEANUP-FN) records, most recently registered first.
 DERIVER is a function returned by `derivation-make-deriver',
 `derivation-make-var-deriver' or `derivation-make-section-filter'.
 CLEANUP-FN, when non-nil, uninstalls the deriver's kill-buffer hooks;
@@ -169,8 +169,8 @@ are set buffer-locally so `auto-revert-mode' (or Global Auto-Revert with
   (let* ((buf (if (bufferp frombuf) frombuf (get-buffer frombuf)))
          (tbuf (if (bufferp tobuf) tobuf (get-buffer tobuf)))
          (last-tick -1)
-         (errbuf (generate-new-buffer
-                  (format " *derivation-err-%s*" (gensym))))
+         ;; Created lazily: only a failing string command needs it.
+         (errbuf nil)
          inner)
     (unless (buffer-live-p tbuf)
       (error "derivation-make-deriver: target buffer is not live"))
@@ -219,10 +219,14 @@ are set buffer-locally so `auto-revert-mode' (or Global Auto-Revert with
                      (erase-buffer)
                      (insert text))
                    (setq-local derivation--error nil))
-                 (with-current-buffer errbuf
-                   (with-silent-modifications (erase-buffer)))
+                 (when (buffer-live-p errbuf)
+                   (with-current-buffer errbuf
+                     (with-silent-modifications (erase-buffer))))
                  t)
                 (`(err . ,msg)
+                 (unless (buffer-live-p errbuf)
+                   (setq errbuf (generate-new-buffer
+                                 (format " *derivation-err-%s*" (gensym)))))
                  (with-current-buffer errbuf
                    (with-silent-modifications
                      (erase-buffer)
@@ -398,7 +402,6 @@ mutations that the watcher would miss.
 Registration installs a watcher on FROMVAR.  `derivation-unregister'
 drops the watcher once the last deriver watching FROMVAR is removed."
   (let* ((entry (gethash fromvar derivation--var-watch-table))
-         (last-gen -1)
          (last-value nil)
          (deriver nil))
     ;; Install or bump refcount.
@@ -408,12 +411,12 @@ drops the watcher once the last deriver watching FROMVAR is removed."
       (add-variable-watcher fromvar #'derivation--var-bump))
     (setq deriver
           (lambda ()
-            (let ((cur-gen (car (gethash fromvar derivation--var-watch-table)))
-                  (cur-val (symbol-value fromvar)))
-              (when (or (/= cur-gen last-gen)
-                        (not (equal cur-val last-value)))
-                (setq last-gen cur-gen
-                      last-value (copy-tree cur-val t))
+            (let ((cur-val (symbol-value fromvar)))
+              ;; Value comparison is the gate, so a `let' rebinding to an
+              ;; `equal' value does not recompute (matching `derivation-make').
+              ;; `equal' also catches in-place mutations the watcher misses.
+              (when (not (equal cur-val last-value))
+                (setq last-value (copy-tree cur-val t))
                 (set tovar (funcall func cur-val))))))
     (derivation-register
      deriver
@@ -656,7 +659,7 @@ aborting the remaining derivers."
 (defun derivation--run-one-pass ()
   "Run all derivers once.  Return non-nil if any deriver changed state."
   (let ((changed nil)
-        (records (copy-tree derivation--storage)))
+        (records (copy-sequence derivation--storage)))
     (dolist (rec records)
       (condition-case err
           (when (funcall (car rec))

@@ -59,6 +59,13 @@
 ;;   ;; Run derivations on idle.
 ;;   (run-with-idle-timer 0.1 t #'derivation-run-hooks)
 ;;
+;; Auto-revert integration:
+;; Target buffers of buffer derivers (external command, Elisp function,
+;; section filter) also get buffer-local `buffer-stale-function' and
+;; `revert-buffer-function'.  Users can therefore drive them with the
+;; built-in `auto-revert-mode' instead of the timer above.  For hidden
+;; (space-prefixed) targets, set `global-auto-revert-non-file-buffers'.
+;;
 ;; Because derivations are memoized, calling them repeatedly when the
 ;; source hasn't changed is a no-op — ideal for idle timers.
 ;;
@@ -150,7 +157,11 @@ last call, TOBUF is left untouched.
 
 When COMMAND fails (non-zero exit) or the function signals an error,
 the target buffer keeps its last good output.  stderr from failed
-commands is captured in a hidden buffer."
+commands is captured in a hidden buffer.
+
+The target buffer's `buffer-stale-function' and `revert-buffer-function'
+are set buffer-locally so `auto-revert-mode' (or Global Auto-Revert with
+`global-auto-revert-non-file-buffers') can drive re-derivation."
   (let* ((buf (if (bufferp frombuf) frombuf (get-buffer frombuf)))
          (tbuf (if (bufferp tobuf) tobuf (get-buffer tobuf)))
          (last-tick -1)
@@ -214,18 +225,23 @@ commands is captured in a hidden buffer."
                  (with-current-buffer tbuf
                    (setq-local derivation--error msg))))
               t)))
-    (let* ((deriver
-            ;; Return the caching wrapper: dirty-check then maybe call inner.
+    (let* ((dirtyp
+            (lambda ()
+              (and (buffer-live-p buf) (buffer-live-p tbuf)
+                   (/= (buffer-chars-modified-tick buf) last-tick))))
+           (run
             (lambda ()
               (when (and (buffer-live-p buf) (buffer-live-p tbuf))
-                (let ((tick (buffer-chars-modified-tick buf)))
-                  (unless (= tick last-tick)
-                    (setq last-tick tick)
-                    (funcall inner))))))
+                (setq last-tick (buffer-chars-modified-tick buf))
+                (funcall inner))))
+           (deriver
+            (lambda ()
+              (when (funcall dirtyp)
+                (funcall run)
+                t)))
            (cleanup
             (derivation--register-kill-hooks deriver (list buf tbuf))))
-      (with-current-buffer tbuf
-        (setq-local derivation--source (cons buf inner)))
+      (derivation--install-target-hooks tbuf buf dirtyp run)
       (derivation-register deriver cleanup)
       deriver)))
 
@@ -473,18 +489,23 @@ Example that filters magit-process to show only failed commands:
                   (erase-buffer)
                   (insert text)))
               t)))
-    (let* ((deriver
-            ;; Return the caching wrapper: dirty-check then maybe call inner.
+    (let* ((dirtyp
+            (lambda ()
+              (and (buffer-live-p buf) (buffer-live-p tbuf)
+                   (/= (buffer-chars-modified-tick buf) last-tick))))
+           (run
             (lambda ()
               (when (and (buffer-live-p buf) (buffer-live-p tbuf))
-                (let ((tick (buffer-chars-modified-tick buf)))
-                  (unless (= tick last-tick)
-                    (setq last-tick tick)
-                    (funcall inner))))))
+                (setq last-tick (buffer-chars-modified-tick buf))
+                (funcall inner))))
+           (deriver
+            (lambda ()
+              (when (funcall dirtyp)
+                (funcall run)
+                t)))
            (cleanup
             (derivation--register-kill-hooks deriver (list buf tbuf))))
-      (with-current-buffer tbuf
-        (setq-local derivation--source (cons buf inner)))
+      (derivation--install-target-hooks tbuf buf dirtyp run)
       (derivation-register deriver cleanup)
       deriver)))
 
@@ -495,6 +516,24 @@ or a string label (data derivations have no source buffer); it is
 shown by `derivation-mode-line' and used by
 `derivation-jump-to-source'.  The inner function bypasses
 memoization, used by `derivation-rerun'.")
+
+(defun derivation--install-target-hooks (tbuf source dirtyp run)
+  "Mark TBUF as a derivation target and wire up auto-revert support.
+SOURCE is recorded in `derivation--source'.  DIRTYP is a zero-arg
+predicate returning non-nil when TBUF is out of date.  RUN is a
+zero-arg function that recomputes TBUF and marks it up to date; it is
+what `derivation-rerun' and `revert-buffer' invoke.
+
+This sets TBUF's buffer-local `buffer-stale-function' and
+`revert-buffer-function' so `auto-revert-mode' (or
+`global-auto-revert-mode' together with
+`global-auto-revert-non-file-buffers') can drive the derivation."
+  (with-current-buffer tbuf
+    (setq-local derivation--source (cons source run))
+    (setq-local buffer-stale-function
+                (lambda (&optional _noconfirm) (funcall dirtyp)))
+    (setq-local revert-buffer-function
+                (lambda (&rest _) (funcall run) t))))
 
 (defun derivation--source-label (source)
   "Return a display name for SOURCE, a buffer or a string label."

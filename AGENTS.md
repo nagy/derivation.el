@@ -19,6 +19,7 @@
 - `derivation-make` takes `(pull-fn push-fn &optional stamp-fn)` — the generic data-deriver primitive. `pull-fn` returns the derived data (a pure scan of global state); `push-fn` renders it and is responsible for selecting its target buffer. Memoized on `equal` of the data (`copy-tree`ed); with `stamp-fn` the pull is skipped while the stamp is unchanged. Does NOT self-register — callers pass the result to `derivation-register`.
 - `derivation-make-tabulated` takes `(entries-fn format &key name sort-key)` — a live `tabulated-list-mode` buffer. `entries-fn` returns `tabulated-list-entries` rows; the deriver polls on the runner schedule and re-renders only on change. Non-idempotent: each call makes a fresh buffer (`generate-new-buffer-name`) and registers a fresh deriver that unregisters when the buffer is killed; renders once at creation; returns the buffer. Errors keep the last good table and set `derivation--error`.
 - `derivation--source` is `(SOURCE . INNER-FN)`: SOURCE is a buffer or a string label (data derivations have no source buffer); both `derivation-mode-line` and `derivation-jump-to-source` handle either.
+- Buffer derivers (`derivation-make-deriver`, `derivation-make-section-filter`) install `buffer-stale-function` and `revert-buffer-function` buffer-locally in the target via `derivation--install-target-hooks`. This lets the built-in `auto-revert-mode` (or `global-auto-revert-mode` + `global-auto-revert-non-file-buffers`) drive re-derivation instead of the idle timer. Staleness is the cheap tick check; `revert-buffer` runs the inner transform directly (bypassing memoization, like `derivation-rerun`).
 - `derivation--node-children` is a `cl-defgeneric` dispatching tree traversal. New deriver types (map.el, seq.el) add `cl-defmethod`s here without changing the walker.
 - Memoization is a single `last-tick` slot per deriver closure (no hash table, no GC fragility). Buffer derivers and section filters key on `buffer-chars-modified-tick`. Variable derivers use a hybrid of variable watcher generation counter + `equal` value comparison with `(copy-tree cur-val t)` for in-place mutation detection.
 - Derivations registered via `derivation-register` (constructors self-register); stored in `derivation--storage` records `(DERIVER . CLEANUP-FN)`; run via `derivation-run-hooks` to a fixpoint. Errors are isolated per-deriver (one broken deriver does not abort others). Buffer derivers auto-unregister when their source or target buffer is killed via a buffer-local `kill-buffer-hook`.
@@ -32,7 +33,7 @@
 
 ## Known limitations (current session)
 
-- Buffer source derivers poll via idle timer. Long-running commands block Emacs (sync `call-process-region`).
+- Buffer source derivers poll via idle timer, or — opt-in — via `auto-revert-mode` using the installed `buffer-stale-function`. Long-running commands block Emacs (sync `call-process-region`).
 - In-place mutations on vectors and hash tables are not caught by `equal` (vectors are handled by `copy-tree cur-val t`; hash tables are not).
 - `derivation--storage` is a double-dash private var; the public API is `derivation-register`/`derivation-unregister`.  Rename the var to `derivation-storage` eventually.
 
@@ -77,6 +78,8 @@ Buffer source = stamp-fn returns `(buf . tick)`. Var source = stamp-fn returns `
 ### Push, not poll
 
 Use `after-change-functions` (or `track-changes` library, available since Emacs 30.1) + a debounce timer per source buffer, running dependents in topological order. Even without topology, a fixpoint loop solves the N-cycle pipeline convergence issue.
+
+The `buffer-stale-function` / `revert-buffer-function` integration is the first step toward letting `auto-revert-mode` replace the package's idle timer for buffer derivers. Data derivers (`derivation-make`, `derivation-make-tabulated`) have no cheap stamp; migrating them onto the same hooks would require a polling staleness check or a real change notification.
 
 ### Async processes
 

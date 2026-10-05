@@ -168,6 +168,63 @@
   (with-temp-buffer
     (should-not derivation--source)))
 
+;;; Auto-revert integration tests
+
+(ert-deftest derivation-buffer-stale-function ()
+  "Target's `buffer-stale-function' tracks the source buffer tick."
+  (let* ((bufs (derivation-test--with-buffers "hello"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-deriver #'upcase src dst)))
+    (funcall deriver)
+    (with-current-buffer dst
+      (should (functionp buffer-stale-function))
+      ;; Fresh after a run.
+      (should-not (funcall buffer-stale-function t))
+      ;; Changing the *target* must not count as stale.
+      (erase-buffer) (insert "tampered")
+      (should-not (funcall buffer-stale-function t)))
+    (with-current-buffer src (erase-buffer) (insert "world"))
+    (with-current-buffer dst
+      (should (funcall buffer-stale-function t)))
+    (derivation-test--kill-buffers (list bufs))))
+
+(ert-deftest derivation-revert-buffer-function ()
+  "`revert-buffer' re-derives the target, bypassing memoization."
+  (let* ((bufs (derivation-test--with-buffers "hello"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-deriver #'upcase src dst)))
+    (funcall deriver)
+    (with-current-buffer dst
+      (should (functionp revert-buffer-function))
+      (erase-buffer) (insert "tampered")
+      ;; revert-buffer must not prompt in batch: pass noconfirm.
+      (revert-buffer nil t)
+      (should (equal (buffer-string) "HELLO")))
+    (derivation-test--kill-buffers (list bufs))))
+
+(ert-deftest derivation-auto-revert-drives-target ()
+  "`auto-revert-mode' in the target re-derives when the source changes."
+  (let* ((bufs (derivation-test--with-buffers "hello"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-deriver #'upcase src dst)))
+    (funcall deriver)
+    (unwind-protect
+        (progn
+          (with-current-buffer dst
+            (auto-revert-mode 1)
+            (should auto-revert-mode)
+            (should (equal (buffer-string) "HELLO")))
+          (with-current-buffer src (erase-buffer) (insert "world"))
+          ;; Drive the auto-revert handler directly; no timer in batch.
+          (auto-revert-buffer dst)
+          (with-current-buffer dst
+            (should (equal (buffer-string) "WORLD"))))
+      (with-current-buffer dst (auto-revert-mode -1)))
+    (derivation-test--kill-buffers (list bufs))))
+
 (ert-deftest derivation-rerun ()
   "derivation-rerun re-runs the derivation, bypassing memoization."
   (let* ((bufs (derivation-test--with-buffers "hello"))

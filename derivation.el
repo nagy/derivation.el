@@ -165,6 +165,92 @@ Read-only is bypassed, as the previous sink did."
       (kill-buffer src))
     (restore-buffer-modified-p modified)))
 
+;;; Memoization primitive
+
+(defconst derivation--unset (make-symbol "derivation--unset")
+  "Sentinel distinguishing \"never run\" from any real value.")
+
+;; Signal raised by a PULL-FN to abort a sync without committing the
+;; stamp, so the next sync retries (used for failed commands).
+(define-error 'derivation--failed "Derivation failed")
+
+(cl-defstruct (derivation--memo (:constructor derivation--memo-create))
+  "Memoization state for a PULL-FN/PUSH-FN pipeline.
+DIRTYP, SYNC and FORCE are closures; see `derivation--memoizer'."
+  dirtyp sync force)
+
+(defun derivation--memoizer (pull-fn push-fn &optional stamp-fn)
+  "Build memoization state for PULL-FN/PUSH-FN versioned by STAMP-FN.
+
+Return a `derivation--memo' with three closures:
+
+  DIRTYP  non-nil when the stamp changed since the last commit (always
+          non-nil when STAMP-FN is nil: polling mode).
+  SYNC    pull, commit the stamp, push when the data changed.  Returns
+          non-nil when it pushed.
+  FORCE   pull and push unconditionally, committing the stamp and the
+          data (bypasses memoization; used by rerun/revert).
+
+PULL-FN may signal `derivation--failed' to abort without committing the
+stamp, so a later SYNC retries.  The signal propagates to the caller."
+  (let ((last-stamp derivation--unset)
+        (last-data derivation--unset))
+    (cl-flet ((commit (data stamp)
+                (setq last-stamp stamp)
+                (unless (equal data last-data)
+                  (setq last-data (copy-tree data t))
+                  (funcall push-fn data)
+                  t)))
+      (derivation--memo-create
+       :dirtyp
+       (lambda ()
+         (or (null stamp-fn)
+             (eq last-stamp derivation--unset)
+             (not (equal (funcall stamp-fn) last-stamp))))
+       :sync
+       (lambda ()
+         (let* ((poll (null stamp-fn))
+                (stamp (unless poll (funcall stamp-fn))))
+           (when (or poll
+                     (eq last-stamp derivation--unset)
+                     (not (equal stamp last-stamp)))
+             (commit (funcall pull-fn) stamp))))
+       :force
+       (lambda ()
+         ;; Bypass memoization: re-render even when the data is
+         ;; unchanged (rerun/revert must repair a tampered target).
+         (let ((data (funcall pull-fn)))
+           (setq last-stamp (and stamp-fn (funcall stamp-fn))
+                 last-data (copy-tree data t))
+           (funcall push-fn data)
+           t))))))
+
+(defun derivation--make-buffer-deriver (buf tbuf pull-fn push-fn &optional extra-cleanup)
+  "Wire a memoized buffer deriver from BUF to TBUF.
+PULL-FN computes the target text (may signal `derivation--failed');
+PUSH-FN renders it.  Memoized on BUF's `buffer-chars-modified-tick'.
+Installs the auto-revert target hooks, registers the deriver with the
+kill-buffer hooks (plus EXTRA-CLEANUP), and returns the deriver."
+  (let* ((memo (derivation--memoizer pull-fn push-fn
+                                     (lambda () (buffer-chars-modified-tick buf))))
+         (live (lambda () (and (buffer-live-p buf) (buffer-live-p tbuf))))
+         (dirtyp (lambda () (and (funcall live) (funcall (derivation--memo-dirtyp memo)))))
+         (guard (lambda (fn)
+                  (condition-case nil (funcall fn) (derivation--failed nil))))
+         (run (lambda ()
+                (when (funcall live)
+                  (funcall guard (derivation--memo-force memo)))))
+         (deriver (lambda ()
+                    (when (funcall live)
+                      (funcall guard (derivation--memo-sync memo)))))
+         (base (derivation--register-kill-hooks deriver (list buf tbuf)))
+         (cleanup (if extra-cleanup
+                      (lambda () (funcall base) (funcall extra-cleanup))
+                    base)))
+    (derivation--install-target-hooks tbuf buf dirtyp run)
+    (derivation-register deriver cleanup)
+    deriver))
+
 ;;;###autoload
 (defun derivation-make-deriver (command frombuf tobuf &rest args)
   "Create a memoized function that derives TOBUF from FROMBUF via COMMAND.
@@ -192,103 +278,78 @@ are set buffer-locally so `auto-revert-mode' (or Global Auto-Revert with
 `global-auto-revert-non-file-buffers') can drive re-derivation."
   (let* ((buf (if (bufferp frombuf) frombuf (get-buffer frombuf)))
          (tbuf (if (bufferp tobuf) tobuf (get-buffer tobuf)))
-         (last-tick -1)
          ;; Created lazily: only a failing string command needs it.
-         (errbuf nil)
-         inner)
+         (errbuf nil))
     (unless (buffer-live-p tbuf)
       (error "derivation-make-deriver: target buffer is not live"))
     (unless (buffer-live-p buf)
       (error "derivation-make-deriver: source buffer is not live"))
-    (setq inner
-          (lambda ()
-            (let* ((content
-                    (with-current-buffer buf
-                      (buffer-substring-no-properties (point-min) (point-max))))
-                   (result
-                    (cl-typecase command
-                      (string
-                       (let ((stderr-file (make-temp-file "deriv-stderr-"))
-                             (exitcode nil))
-                         (unwind-protect
-                             (with-temp-buffer
-                               (setq exitcode
-                                     (apply #'call-process-region
-                                            content nil command nil
-                                            (list (current-buffer) stderr-file)
-                                            nil args))
-                               (let ((stdout (buffer-string)))
-                                 (if (zerop exitcode)
-                                     (cons 'ok stdout)
-                                   (let ((errtext
-                                          (with-temp-buffer
-                                            (insert-file-contents stderr-file)
-                                            (buffer-string))))
-                                     (cons 'err
-                                           (if (string= errtext "")
-                                               stdout
-                                             errtext))))))
-                           (delete-file stderr-file))))
-                      (function
-                       (condition-case e
-                           (cons 'ok (funcall command content))
-                         (error (cons 'err (error-message-string e)))))
-                      (t
-                       (error "COMMAND must be string or function, got %S"
-                              (type-of command))))))
-              (pcase result
-                (`(ok . ,text)
-                 (with-current-buffer tbuf
-                   (derivation--replace-contents text)
-                   (setq-local derivation--error nil))
-                 (when (buffer-live-p errbuf)
-                   (with-current-buffer errbuf
-                     (with-silent-modifications (erase-buffer))))
-                 t)
-                (`(err . ,msg)
-                 (unless (buffer-live-p errbuf)
-                   (setq errbuf (generate-new-buffer
-                                 (format " *derivation-err-%s*" (gensym)))))
-                 (with-current-buffer errbuf
-                   (with-silent-modifications
-                     (erase-buffer)
-                     (insert msg)))
-                 (with-current-buffer tbuf
-                   (setq-local derivation--error msg))
-                 nil)))))
-    (let* ((dirtyp
-            (lambda ()
-              (and (buffer-live-p buf) (buffer-live-p tbuf)
-                   (/= (buffer-chars-modified-tick buf) last-tick))))
-           (run
-            (lambda ()
-              (when (and (buffer-live-p buf) (buffer-live-p tbuf))
-                ;; Advance the memo tick only on success so a failed
-                ;; command is retried on the next pass, not only after
-                ;; the next source edit.
-                (when (funcall inner)
-                  (setq last-tick (buffer-chars-modified-tick buf))))))
-           (deriver
-            ;; Return RUN's value so a failed command reports "no change"
-            ;; and the fixpoint loop stops (it retries on the next pass).
-            (lambda ()
-              (when (funcall dirtyp)
-                (funcall run))))
-           (cleanup
-            (let ((unhook
-                   (derivation--register-kill-hooks deriver (list buf tbuf))))
-              (lambda ()
-                (funcall unhook)
-                (when (buffer-live-p errbuf)
-                  (kill-buffer errbuf))))))
-      (derivation--install-target-hooks tbuf buf dirtyp run)
-      (derivation-register deriver cleanup)
-      deriver)))
+    (derivation--make-buffer-deriver
+     buf tbuf
+     ;; PULL: run the command.  On failure, record the error and signal
+     ;; `derivation--failed' so SYNC aborts without committing the tick
+     ;; (the next pass retries).
+     (lambda ()
+       (let* ((content
+               (with-current-buffer buf
+                 (buffer-substring-no-properties (point-min) (point-max))))
+              (result
+               (cl-typecase command
+                 (string
+                  (let ((stderr-file (make-temp-file "deriv-stderr-"))
+                        (exitcode nil))
+                    (unwind-protect
+                        (with-temp-buffer
+                          (setq exitcode
+                                (apply #'call-process-region
+                                       content nil command nil
+                                       (list (current-buffer) stderr-file)
+                                       nil args))
+                          (let ((stdout (buffer-string)))
+                            (if (zerop exitcode)
+                                (cons 'ok stdout)
+                              (let ((errtext
+                                     (with-temp-buffer
+                                       (insert-file-contents stderr-file)
+                                       (buffer-string))))
+                                (cons 'err
+                                      (if (string= errtext "")
+                                          stdout
+                                        errtext))))))
+                      (delete-file stderr-file))))
+                 (function
+                  (condition-case e
+                      (cons 'ok (funcall command content))
+                    (error (cons 'err (error-message-string e)))))
+                 (t
+                  (error "COMMAND must be string or function, got %S"
+                         (type-of command))))))
+         (pcase result
+           (`(ok . ,text) text)
+           (`(err . ,msg)
+            (unless (buffer-live-p errbuf)
+              (setq errbuf (generate-new-buffer
+                            (format " *derivation-err-%s*" (gensym)))))
+            (with-current-buffer errbuf
+              (with-silent-modifications
+                (erase-buffer)
+                (insert msg)))
+            (with-current-buffer tbuf
+              (setq-local derivation--error msg))
+            (signal 'derivation--failed nil)))))
+     ;; PUSH: render the text and clear any prior error.
+     (lambda (text)
+       (with-current-buffer tbuf
+         (derivation--replace-contents text)
+         (setq-local derivation--error nil))
+       (when (buffer-live-p errbuf)
+         (with-current-buffer errbuf
+           (with-silent-modifications (erase-buffer)))))
+     (lambda ()
+       (when (buffer-live-p errbuf)
+         (kill-buffer errbuf))))))
 
 ;;; Generic data derivation
-
-(defconst derivation--unset (make-symbol "derivation--unset")
-  "Sentinel distinguishing \"never run\" from any real value.")
 
 ;;;###autoload
 (defun derivation-make (pull-fn push-fn &optional stamp-fn)
@@ -311,21 +372,9 @@ PULL-FN and pushes only on a data change.
 The returned function takes no arguments and is compatible with
 `derivation-run-hooks'; it is NOT registered automatically — pass it
 to `derivation-register' (or `derivation-unregister') explicitly."
-  (let ((last-stamp derivation--unset)
-        (last-data derivation--unset))
+  (let ((memo (derivation--memoizer pull-fn push-fn stamp-fn)))
     (lambda ()
-      (let* ((poll (null stamp-fn))
-             (stamp (unless poll (funcall stamp-fn)))
-             (dirty (or poll
-                        (eq last-stamp derivation--unset)
-                        (not (equal stamp last-stamp)))))
-        (when dirty
-          (setq last-stamp stamp)
-          (let ((data (funcall pull-fn)))
-            (unless (equal data last-data)
-              (setq last-data (copy-tree data t))
-              (funcall push-fn data)
-              t)))))))
+      (funcall (derivation--memo-sync memo)))))
 
 ;;;###autoload
 (cl-defun derivation-make-tabulated (entries-fn format &key name sort-key)
@@ -423,33 +472,26 @@ mutations that the watcher would miss.
 
 Registration installs a watcher on FROMVAR.  `derivation-unregister'
 drops the watcher once the last deriver watching FROMVAR is removed."
-  (let* ((entry (gethash fromvar derivation--var-watch-table))
-         (last-value nil)
-         (deriver nil))
+  (let ((entry (gethash fromvar derivation--var-watch-table))
+        (memo (derivation--memoizer
+               (lambda () (symbol-value fromvar))
+               (lambda (val) (set tovar (funcall func val))))))
     ;; Install or bump refcount.
     (if entry
         (cl-incf (cdr entry))
       (puthash fromvar (cons 0 1) derivation--var-watch-table)
       (add-variable-watcher fromvar #'derivation--var-bump))
-    (setq deriver
-          (lambda ()
-            (let ((cur-val (symbol-value fromvar)))
-              ;; Value comparison is the gate, so a `let' rebinding to an
-              ;; `equal' value does not recompute (matching `derivation-make').
-              ;; `equal' also catches in-place mutations the watcher misses.
-              (when (not (equal cur-val last-value))
-                (setq last-value (copy-tree cur-val t))
-                (set tovar (funcall func cur-val))))))
-    (derivation-register
-     deriver
-     (lambda ()
-       (let ((rec (gethash fromvar derivation--var-watch-table)))
-         (when rec
-           (if (> (cdr rec) 1)
-               (cl-decf (cdr rec))
-             (remhash fromvar derivation--var-watch-table)
-             (remove-variable-watcher fromvar #'derivation--var-bump))))))
-    deriver))
+    (let ((deriver (lambda () (funcall (derivation--memo-sync memo)))))
+      (derivation-register
+       deriver
+       (lambda ()
+         (let ((rec (gethash fromvar derivation--var-watch-table)))
+           (when rec
+             (if (> (cdr rec) 1)
+                 (cl-decf (cdr rec))
+               (remhash fromvar derivation--var-watch-table)
+               (remove-variable-watcher fromvar #'derivation--var-bump))))))
+      deriver)))
 
 ;;; Section tree walk
 
@@ -502,52 +544,30 @@ Example that filters magit-process to show only failed commands:
                   (/= 0 (process-exit-status proc)))))
          (magit-process-buffer t)
          (get-buffer-create \"*magit-failures*\")))"
-  (let* ((buf (if (bufferp frombuf) frombuf (get-buffer frombuf)))
-         (tbuf (if (bufferp tobuf) tobuf (get-buffer tobuf)))
-         (last-tick -1)
-         inner)
+  (let ((buf (if (bufferp frombuf) frombuf (get-buffer frombuf)))
+        (tbuf (if (bufferp tobuf) tobuf (get-buffer tobuf))))
     (unless (buffer-live-p tbuf)
       (error "derivation-make-section-filter: target buffer is not live"))
     (unless (buffer-live-p buf)
       (error "derivation-make-section-filter: source buffer is not live"))
-    (setq inner
-          (lambda ()
-            (let ((text
-                   (with-current-buffer buf
-                     (if (and (boundp 'magit-root-section)
-                              (local-variable-p 'magit-root-section)
-                              magit-root-section)
-                         (mapconcat
-                          (lambda (section)
-                            (with-no-warnings
-                              (buffer-substring (slot-value section 'start)
-                                                (slot-value section 'end))))
-                          (derivation--walk-tree magit-root-section predicate t)
-                          "\n")
-                       (buffer-string)))))
-              (with-current-buffer tbuf
-                (derivation--replace-contents text))
-              t)))
-    (let* ((dirtyp
-            (lambda ()
-              (and (buffer-live-p buf) (buffer-live-p tbuf)
-                   (/= (buffer-chars-modified-tick buf) last-tick))))
-           (run
-            (lambda ()
-              (when (and (buffer-live-p buf) (buffer-live-p tbuf))
-                (setq last-tick (buffer-chars-modified-tick buf))
-                (funcall inner))))
-           (deriver
-            ;; Return RUN's value so a failed command reports "no change"
-            ;; and the fixpoint loop stops (it retries on the next pass).
-            (lambda ()
-              (when (funcall dirtyp)
-                (funcall run))))
-           (cleanup
-            (derivation--register-kill-hooks deriver (list buf tbuf))))
-      (derivation--install-target-hooks tbuf buf dirtyp run)
-      (derivation-register deriver cleanup)
-      deriver)))
+    (derivation--make-buffer-deriver
+     buf tbuf
+     (lambda ()
+       (with-current-buffer buf
+         (if (and (boundp 'magit-root-section)
+                  (local-variable-p 'magit-root-section)
+                  magit-root-section)
+             (mapconcat
+              (lambda (section)
+                (with-no-warnings
+                  (buffer-substring (slot-value section 'start)
+                                    (slot-value section 'end))))
+              (derivation--walk-tree magit-root-section predicate t)
+              "\n")
+           (buffer-string))))
+     (lambda (text)
+       (with-current-buffer tbuf
+         (derivation--replace-contents text))))))
 
 (defvar-local derivation--source nil
   "When non-nil, this buffer is a derivation target.

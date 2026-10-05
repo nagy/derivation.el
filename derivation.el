@@ -118,15 +118,19 @@ Returns non-nil if DERIVER was registered."
 
 (defun derivation--register-kill-hooks (deriver bufs)
   "Install a buffer-local `kill-buffer-hook' in each live buffer of BUFS.
-The hook removes DERIVER's record from `derivation--storage' when the
-buffer is killed (kill-buffer runs the hook with the buffer current, so
-a buffer-local hook fires directly).  Returns a cleanup function that
-uninstalls the hooks."
+The hook removes DERIVER's record from `derivation--storage' and runs
+that record's cleanup function, so resources owned by the deriver are
+released when a source or target buffer dies.
+
+Returns a cleanup function that uninstalls the hooks; it is idempotent
+and safe to call from within the hook itself."
   (let ((hook
          (lambda ()
-           (setq derivation--storage
-                 (delete (assq deriver derivation--storage)
-                         derivation--storage)))))
+           (let ((rec (assq deriver derivation--storage)))
+             (when rec
+               (setq derivation--storage (delq rec derivation--storage))
+               (when (cdr rec)
+                 (funcall (cdr rec))))))))
     (dolist (buf bufs)
       (when (buffer-live-p buf)
         (with-current-buffer buf
@@ -216,15 +220,16 @@ are set buffer-locally so `auto-revert-mode' (or Global Auto-Revert with
                      (insert text))
                    (setq-local derivation--error nil))
                  (with-current-buffer errbuf
-                   (with-silent-modifications (erase-buffer))))
+                   (with-silent-modifications (erase-buffer)))
+                 t)
                 (`(err . ,msg)
                  (with-current-buffer errbuf
                    (with-silent-modifications
                      (erase-buffer)
                      (insert msg)))
                  (with-current-buffer tbuf
-                   (setq-local derivation--error msg))))
-              t)))
+                   (setq-local derivation--error msg))
+                 nil)))))
     (let* ((dirtyp
             (lambda ()
               (and (buffer-live-p buf) (buffer-live-p tbuf)
@@ -232,15 +237,24 @@ are set buffer-locally so `auto-revert-mode' (or Global Auto-Revert with
            (run
             (lambda ()
               (when (and (buffer-live-p buf) (buffer-live-p tbuf))
-                (setq last-tick (buffer-chars-modified-tick buf))
-                (funcall inner))))
+                ;; Advance the memo tick only on success so a failed
+                ;; command is retried on the next pass, not only after
+                ;; the next source edit.
+                (when (funcall inner)
+                  (setq last-tick (buffer-chars-modified-tick buf))))))
            (deriver
+            ;; Return RUN's value so a failed command reports "no change"
+            ;; and the fixpoint loop stops (it retries on the next pass).
             (lambda ()
               (when (funcall dirtyp)
-                (funcall run)
-                t)))
+                (funcall run))))
            (cleanup
-            (derivation--register-kill-hooks deriver (list buf tbuf))))
+            (let ((unhook
+                   (derivation--register-kill-hooks deriver (list buf tbuf))))
+              (lambda ()
+                (funcall unhook)
+                (when (buffer-live-p errbuf)
+                  (kill-buffer errbuf))))))
       (derivation--install-target-hooks tbuf buf dirtyp run)
       (derivation-register deriver cleanup)
       deriver)))
@@ -379,7 +393,10 @@ removed with `derivation-unregister'.
 
 Memoization is hybrid: a variable watcher provides a fast \"not
 dirty\" check, and an `equal' value comparison catches in-place
-mutations that the watcher would miss."
+mutations that the watcher would miss.
+
+Registration installs a watcher on FROMVAR.  `derivation-unregister'
+drops the watcher once the last deriver watching FROMVAR is removed."
   (let* ((entry (gethash fromvar derivation--var-watch-table))
          (last-gen -1)
          (last-value nil)
@@ -398,7 +415,15 @@ mutations that the watcher would miss."
                 (setq last-gen cur-gen
                       last-value (copy-tree cur-val t))
                 (set tovar (funcall func cur-val))))))
-    (derivation-register deriver)
+    (derivation-register
+     deriver
+     (lambda ()
+       (let ((rec (gethash fromvar derivation--var-watch-table)))
+         (when rec
+           (if (> (cdr rec) 1)
+               (cl-decf (cdr rec))
+             (remhash fromvar derivation--var-watch-table)
+             (remove-variable-watcher fromvar #'derivation--var-bump))))))
     deriver))
 
 ;;; Generic tree walk
@@ -499,10 +524,11 @@ Example that filters magit-process to show only failed commands:
                 (setq last-tick (buffer-chars-modified-tick buf))
                 (funcall inner))))
            (deriver
+            ;; Return RUN's value so a failed command reports "no change"
+            ;; and the fixpoint loop stops (it retries on the next pass).
             (lambda ()
               (when (funcall dirtyp)
-                (funcall run)
-                t)))
+                (funcall run))))
            (cleanup
             (derivation--register-kill-hooks deriver (list buf tbuf))))
       (derivation--install-target-hooks tbuf buf dirtyp run)
@@ -511,11 +537,11 @@ Example that filters magit-process to show only failed commands:
 
 (defvar-local derivation--source nil
   "When non-nil, this buffer is a derivation target.
-Value is (SOURCE . INNER-TRANSFORM-FUNCTION).  SOURCE is a buffer
-or a string label (data derivations have no source buffer); it is
-shown by `derivation-mode-line' and used by
-`derivation-jump-to-source'.  The inner function bypasses
-memoization, used by `derivation-rerun'.")
+Value is (SOURCE . RUN-FN).  SOURCE is a buffer or a string label
+\(data derivations have no source buffer); it is shown by
+`derivation-mode-line' and used by `derivation-jump-to-source'.
+RUN-FN recomputes the target bypassing memoization; used by
+`derivation-rerun' and `revert-buffer'.")
 
 (defun derivation--install-target-hooks (tbuf source dirtyp run)
   "Mark TBUF as a derivation target and wire up auto-revert support.
@@ -529,6 +555,7 @@ This sets TBUF's buffer-local `buffer-stale-function' and
 `global-auto-revert-mode' together with
 `global-auto-revert-non-file-buffers') can drive the derivation."
   (with-current-buffer tbuf
+    ;; The cdr bypasses memoization (used by `derivation-rerun').
     (setq-local derivation--source (cons source run))
     (setq-local buffer-stale-function
                 (lambda (&optional _noconfirm) (funcall dirtyp)))

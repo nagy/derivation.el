@@ -297,6 +297,85 @@
       (should (string-match "errmsg" derivation--error)))
     (derivation-test--kill-buffers (list bufs))))
 
+(ert-deftest derivation-failure-retries-same-source ()
+  "A failed command is retried on later calls without a source edit."
+  (let* ((bufs (derivation-test--with-buffers "x"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (calls 0)
+         (flaky (lambda (c)
+                  (cl-incf calls)
+                  (if (= calls 1) (error "first fails") (upcase c))))
+         (deriver (derivation-make-deriver flaky src dst)))
+    ;; First call fails; source tick must not be consumed.
+    (funcall deriver)
+    (should (= calls 1))
+    (should (with-current-buffer dst derivation--error))
+    ;; Second call retries even though the source is unchanged.
+    (funcall deriver)
+    (should (= calls 2))
+    (should (equal (with-current-buffer dst (buffer-string)) "X"))
+    (should-not (with-current-buffer dst derivation--error))
+    ;; Third call is memoized (no extra work).
+    (funcall deriver)
+    (should (= calls 2))
+    (derivation-test--kill-buffers (list bufs))))
+
+(ert-deftest derivation-failure-does-not-spin-fixpoint ()
+  "A failing deriver is attempted once per `derivation-run-hooks' call."
+  (let* ((bufs (derivation-test--with-buffers "x"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (calls 0)
+         (always-fails (lambda (_c) (cl-incf calls) (error "nope")))
+         (deriver (derivation-make-deriver always-fails src dst)))
+    (unwind-protect
+        (progn
+          (derivation-run-hooks)
+          ;; Must not be retried `derivation--max-passes' times in one call.
+          (should (= calls 1)))
+      (derivation-unregister deriver)
+      (derivation-test--kill-buffers (list bufs)))))
+
+(ert-deftest derivation-stderr-buffer-killed-on-unregister ()
+  "Unregistering a deriver kills its hidden stderr buffer."
+  (let* ((bufs (derivation-test--with-buffers "x"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-deriver #'identity src dst))
+         (name (buffer-name
+                (car (seq-filter
+                      (lambda (b) (string-match-p "derivation-err" (buffer-name b)))
+                      (buffer-list))))))
+    (should (get-buffer name))
+    (derivation-unregister deriver)
+    (should-not (get-buffer name))
+    (derivation-test--kill-buffers (list bufs))))
+
+(ert-deftest derivation-var-watcher-removed-on-unregister ()
+  "Unregistering the last var deriver removes the variable watcher."
+  ;; Use fresh uninterned symbols so other tests' watchers do not
+  ;; inflate the refcount for this source.
+  (let* ((sym (make-symbol "derivation-test-var"))
+         (out (make-symbol "derivation-test-out")))
+    (set sym '(1 2 3))
+    (let ((deriver (derivation-make-var-deriver #'length sym out)))
+      (should (gethash sym derivation--var-watch-table))
+      (derivation-unregister deriver)
+      (should-not (gethash sym derivation--var-watch-table)))))
+
+(ert-deftest derivation-var-watcher-refcount ()
+  "Two derivers on the same source keep the watcher until both go."
+  (let* ((sym (make-symbol "derivation-test-var2"))
+         (out (make-symbol "derivation-test-out2")))
+    (set sym '(1 2 3))
+    (let ((d1 (derivation-make-var-deriver #'length sym out))
+          (d2 (derivation-make-var-deriver #'identity sym out)))
+      (derivation-unregister d1)
+      (should (gethash sym derivation--var-watch-table))
+      (derivation-unregister d2)
+      (should-not (gethash sym derivation--var-watch-table)))))
+
 (ert-deftest derivation-failure-recovers ()
   "After a failure, fixing the source restores the derivation."
   (skip-unless (executable-find "sh"))

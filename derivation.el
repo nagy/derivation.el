@@ -451,33 +451,24 @@ drops the watcher once the last deriver watching FROMVAR is removed."
              (remove-variable-watcher fromvar #'derivation--var-bump))))))
     deriver))
 
-;;; Generic tree walk
-
-(cl-defgeneric derivation--node-children (node)
-  "Return the children of NODE as a list, or nil.
-
-The default method handles EIEIO objects that have a `children'
-slot.  Additional methods can be defined for hash tables, alists,
-lists, vectors, etc. — enabling new deriver types (map-filter,
-seq-filter, etc.) without changing the tree walker."
-  (when (and (fboundp 'eieio-object-p)
-             (eieio-object-p node)
-             (with-no-warnings (slot-exists-p node 'children)))
-    (with-no-warnings (slot-value node 'children))))
+;;; Section tree walk
 
 (defun derivation--walk-tree (root predicate &optional skip-root)
-  "Traverse tree from ROOT, collecting nodes matching PREDICATE.
-Uses `derivation--node-children' to recurse into each node.
-Returns matching nodes in preorder.  When SKIP-ROOT is non-nil,
-PREDICATE is not applied to ROOT itself, only to its descendants."
+  "Traverse the section tree from ROOT, collecting nodes matching PREDICATE.
+Children are read from each node's EIEIO `children' slot (the only
+concrete tree is magit's `magit-section').  Returns matching nodes in
+preorder.  When SKIP-ROOT is non-nil, PREDICATE is not applied to ROOT
+itself, only to its descendants."
   (let ((results nil))
-    (cl-labels ((walk (node)
+    (cl-labels ((children (node)
+                  (with-no-warnings (slot-value node 'children)))
+                (walk (node)
                   (when (funcall predicate node)
                     (push node results))
-                  (dolist (child (derivation--node-children node))
+                  (dolist (child (children node))
                     (walk child))))
       (if skip-root
-          (dolist (child (derivation--node-children root))
+          (dolist (child (children root))
             (walk child))
         (walk root)))
     (nreverse results)))

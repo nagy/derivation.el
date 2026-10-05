@@ -734,11 +734,10 @@ Without magit loaded, falls back to copying the whole buffer."
 
 Regression test for the section-filter fix: a predicate matching the
 root must not duplicate the whole buffer text."
+  (require 'eieio)
   (cl-defstruct (derivation-test--node (:constructor derivation-test--mknode
                                                      (start end children)))
     start end children)
-  (cl-defmethod derivation--node-children ((node derivation-test--node))
-    (derivation-test--node-children node))
   (let* ((leaf (derivation-test--mknode 7 9 nil))
          (mid (derivation-test--mknode 6 20 (list leaf)))
          (root (derivation-test--mknode 1 100 (list mid))))
@@ -985,5 +984,44 @@ the in-place change and triggers recomputation regardless."
                                       (eval (cadr derivation-mode-line))))))
       (kill-buffer buf))))
 
+(ert-deftest derivation-tabulated-sort-key ()
+  "The SORT-KEY argument sets `tabulated-list-sort-key'."
+  (let ((buf (derivation-make-tabulated
+              (lambda () '((a ["A" "1"])))
+              [("Name" 20 t) ("PID" 8 t)]
+              :name " *deriv-test-tab*"
+              :sort-key '("PID" . nil))))
+    (unwind-protect
+        (with-current-buffer buf
+          (should (equal tabulated-list-sort-key '("PID" . nil))))
+      (kill-buffer buf))))
+
+(ert-deftest derivation-tabulated-rerun ()
+  "`derivation-rerun' works on a tabulated target (string-named source)."
+  (let ((state '((a ["A" "1"]))))
+    (let ((buf (derivation-make-tabulated
+                (lambda () state)
+                [("Name" 20 t)]
+                :name " *deriv-test-tab*")))
+      (unwind-protect
+          (progn
+            (with-current-buffer buf
+              (should (equal tabulated-list-entries '((a ["A" "1"]))))
+              (setq state '((a ["A" "1"]) (b ["B" "2"])))
+              (derivation-rerun)
+              (should (equal tabulated-list-entries
+                             '((a ["A" "1"]) (b ["B" "2"]))))))
+        (kill-buffer buf)))))
+
+(ert-deftest derivation-buffer-names-as-sources ()
+  "Constructors accept buffer names, not just buffer objects."
+  (let* ((bufs (derivation-test--with-buffers "hello"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-deriver
+                   #'upcase (buffer-name src) (buffer-name dst))))
+    (funcall deriver)
+    (should (equal (with-current-buffer dst (buffer-string)) "HELLO"))
+    (derivation-test--kill-buffers (list bufs))))
 (provide 'derivation-tests)
 ;;; derivation-tests.el ends here

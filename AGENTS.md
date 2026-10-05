@@ -21,7 +21,7 @@
 - `derivation--source` is `(SOURCE . RUN-FN)`: SOURCE is a buffer or a string label (data derivations have no source buffer); RUN-FN recomputes the target bypassing memoization (used by `derivation-rerun` and `revert-buffer`). Both `derivation-mode-line` and `derivation-jump-to-source` handle either SOURCE form.
 - `derivation-rerun` collects the upstream chain by `push`-ing while walking current → upstream, so the list is already upstream → downstream; it iterates it directly (no `reverse`). Running downstream-first would let a target transform read a stale intermediate. `derivation-run-hooks` converges via its fixpoint loop instead.
 - Buffer derivers (`derivation-make-deriver`, `derivation-make-section-filter`) install `buffer-stale-function` and `revert-buffer-function` buffer-locally in the target via `derivation--install-target-hooks`. This lets the built-in `auto-revert-mode` (or `global-auto-revert-mode` + `global-auto-revert-non-file-buffers`) drive re-derivation instead of the idle timer. Staleness is the cheap tick check; `revert-buffer` runs the inner transform directly (bypassing memoization, like `derivation-rerun`).
-- `derivation--node-children` is a `cl-defgeneric` dispatching tree traversal. New deriver types (map.el, seq.el) add `cl-defmethod`s here without changing the walker.
+- `derivation--walk-tree` traverses the section tree, reading each node's EIEIO `children` slot directly (the only concrete tree is magit's `magit-section`). No `cl-defgeneric`; add one only if a second concrete tree type appears.
 - Memoization is a single `last-tick` slot per deriver closure (no hash table, no GC fragility). Buffer derivers and section filters key on `buffer-chars-modified-tick`. Variable derivers gate on `equal` of the value with `(copy-tree cur-val t)` (for in-place mutation detection); the watcher generation is no longer used for the dirty check, so a `let` rebinding to an `equal` value does not recompute.
 - Both sinks write via `derivation--replace-contents`, which uses `replace-region-contents` (Emacs 31+; falls back to `replace-buffer-contents`) so point, markers, and `window-start` survive updates and `after-change-functions` fire (font-lock etc. see the change). It preserves the buffer's modified state rather than using `with-silent-modifications`.
 - Cleanup is deterministic: `derivation-unregister` runs each record's cleanup fn. `derivation--register-kill-hooks` runs the cleanup from the buffer-local `kill-buffer-hook` too (idempotent), so killing a source/target frees the deriver's watcher/hidden buffers. `derivation-make-deriver` allocates its hidden stderr buffer lazily (first failed string command) and kills it on unregister/buffer kill; `derivation-make-var-deriver` decrements the `derivation--var-watch-table` refcount and removes the variable watcher at zero. `derivation--run-one-pass` snapshots `derivation--storage` with `copy-sequence`.
@@ -56,7 +56,7 @@ The rename from the old `make-*` names landed in the pre-0.1 history
 
 ### Unify the stamp abstraction
 
-Status: `derivation-make` (pull-fn, push-fn, optional stamp-fn) exists as the generic primitive, and `derivation-make-tabulated` (entries-fn, format, &key name sort-key) is its first specialization — a data-deriver with no stamp that polls and memoizes on `equal` of the data. The three original constructors are not yet migrated; tracked in the Open work items section, item 6.
+Status: `derivation-make` (pull-fn, push-fn, optional stamp-fn) exists as the generic primitive, and `derivation-make-tabulated` (entries-fn, format, &key name sort-key) is its first specialization — a data-deriver with no stamp that polls and memoizes on `equal` of the data. The three original constructors are not yet migrated; tracked in the Open work items section, item 4.
 
 Buffer-tick memoization and var-watcher+equal memoization are the same pattern: `(last-stamp, pull-fn, push-fn)`:
 
@@ -105,14 +105,12 @@ Numbered work items for this project.  **Remove items entirely once finished** (
 
 ### API / design
 
-1. **Drop the `cl-defgeneric` tree walk.** `derivation--node-children` is speculative generality (map.el, seq.el deriver types that don't exist yet) that adds a soft EIEIO dependency and a `with-no-warnings` slot access. Introduce the generic only when a second concrete tree appears.
-
-2. **Async processes.** `make-process` + sentinel with a generation counter to discard stale results. `call-process-region` freezes the UI on every keystroke-then-idle for slow commands.
+1. **Async processes.** `make-process` + sentinel with a generation counter to discard stale results. `call-process-region` freezes the UI on every keystroke-then-idle for slow commands.
 
 ### Cleanup
 
-3. **Test `derivation-mode-line-form-evaluates` tests implementation, not behavior.** It `eval`s `(cadr derivation-mode-line)` directly. A rendering-based test is impossible in the batch suite: `format-mode-line` is a deliberate no-op when `noninteractive` (see `Fformat_mode_line` in xdisp.c), so the rendered string can't be checked under `emacs --batch`. Either keep the eval-based test or move the suite to a display-backed runner.
+2. **Test `derivation-mode-line-form-evaluates` tests implementation, not behavior.** It `eval`s `(cadr derivation-mode-line)` directly. A rendering-based test is impossible in the batch suite: `format-mode-line` is a deliberate no-op when `noninteractive` (see `Fformat_mode_line` in xdisp.c), so the rendered string can't be checked under `emacs --batch`. Either keep the eval-based test or move the suite to a display-backed runner.
 
-4. **Minor: stderr capture.** `with-temp-buffer` + `insert-file-contents` for stderr could be a single `insert-file-contents` into a reused buffer.
+3. **Minor: stderr capture.** `with-temp-buffer` + `insert-file-contents` for stderr could be a single `insert-file-contents` into a reused buffer.
 
-5. **Migrate the three constructors onto `derivation-make`.** `derivation-make-deriver` (content pipeline), `derivation-make-var-deriver`, and `derivation-make-section-filter` should become thin wrappers around `derivation-make` with the appropriate stamp (buffer tick / watcher generation), replacing three copies of the memoization pattern with the unified one. Each becomes ~5 lines.
+4. **Migrate the three constructors onto `derivation-make`.** `derivation-make-deriver` (content pipeline), `derivation-make-var-deriver`, and `derivation-make-section-filter` should become thin wrappers around `derivation-make` with the appropriate stamp (buffer tick / watcher generation), replacing three copies of the memoization pattern with the unified one. Each becomes ~5 lines.

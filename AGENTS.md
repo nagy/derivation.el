@@ -8,7 +8,7 @@
 
 - `derivation.el` — single-file library, ~400 lines.
 - `derivation-tests.el` — ERT tests.
-- `flake.nix` — Nix flake for non-interactive batch testing (`nix build` runs the ERT suite; the devShell provides Emacs).
+- `flake.nix` — Nix flake for non-interactive batch testing (`nix build` runs the ERT suite; the devShell provides Emacs). The package version derives from `self.lastModifiedDate` (last commit date, sliced to `0-unstable-YYYY-MM-DD`); pure evaluation has no timestamp, so it falls back to `0-unstable-1970-01-01`. Never hand-edit the date.
 
 ## Conventions
 

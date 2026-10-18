@@ -44,14 +44,25 @@
               projectRootFile = "flake.nix";
               programs.nixfmt.enable = true;
             };
+            # Nix rejects versions Nixpkgs cannot parse. Convention for
+            # unreleased packages: <upstream-version>-unstable-<YYYY-MM-DD>.
+            # lastModifiedDate is the last commit date of the flake repo
+            # (format YYYYMMDDHHMMSS), so slice it into a date.
+            # Pure evaluation has no lastModifiedDate (null): fall back to
+            # the epoch. A dirty tree does NOT move the date.
+            src-version =
+              let
+                last = self.lastModifiedDate or null;
+              in
+              if last == null then
+                "0-unstable-1970-01-01"
+              else
+                "0-unstable-${builtins.substring 0 4 last}-${builtins.substring 4 2 last}-${builtins.substring 6 2 last}";
           in
           {
             packages.derivation = melpaBuild {
               pname = "derivation";
-              # Nix rejects versions Nixpkgs cannot parse. Convention for
-              # unreleased packages: <upstream-version>-unstable-<YYYY-MM-DD>,
-              # where the date is the last commit touching the source.
-              version = "0.1.0-unstable-2026-08-08";
+              version = src-version;
 
               src = lib.cleanSource ./.;
 

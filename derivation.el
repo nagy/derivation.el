@@ -113,15 +113,14 @@ COMMAND, DIRECTORY and ENVIRONMENT hold unresolved spec forms
 (strings, `derivation-input's or functions).  SPEC holds the
 resolved runtime spec of the current or last process;
 PENDING-SPEC holds a debounced change.  DERIVER is the function
-registered with `derivation-run-hooks'.  AUTO-RESTART, BACKOFF,
-STOP-SIGNAL, STOP-TIMEOUT and DEBOUNCE are policy options.
-STATUS is one of `:running', `:stopping', `:exited', `:stopped' or
-`:failed'."
+registered with `derivation-run-hooks'.  AUTO-RESTART, BACKOFF, STOP-SIGNAL, STOP-TIMEOUT, DEBOUNCE and
+ON-CHANGE are policy options.  STATUS is one of `:running',
+`:stopping', `:exited', `:stopped' or `:failed'."
   name command directory environment
   spec pending-spec next-spec inputs
   log deriver process
   desired status
-  auto-restart backoff stop-signal stop-timeout debounce
+  auto-restart backoff stop-signal stop-timeout debounce on-change
   timer restart-timer stop-timer restart-count started-at stoppingp
   last-error kill-hook)
 
@@ -1120,19 +1119,45 @@ STOPPINGP, and starts NEXT-SPEC when one is pending."
           (derivation--process-schedule-restart process)))))))
 
 (defun derivation--process-fire-pending (process)
-  "Start PROCESS's pending spec, if any."
-  (let ((pending (derivation-process-pending-spec process)))
-    (when (and pending (not (derivation-process-stoppingp process)))
-      (setf (derivation-process-pending-spec process) nil)
-      (if (derivation-process-live-p process)
-          (progn
-            (setf (derivation-process-next-spec process) pending)
-            (derivation--process-request-stop process))
-        (setf (derivation-process-spec process) pending)
-        (derivation--process-start process pending)))))
+  "Reconcile PROCESS after its debounce timer fires."
+  (when (derivation-process-pending-spec process)
+    (setf (derivation-process-pending-spec process) nil)
+    (derivation--process-apply process t)))
 
-(defun derivation--process-apply (process)
-  "Resolve PROCESS's spec and reconcile.  Return non-nil on change."
+(defun derivation--process-change (process spec)
+  "Apply SPEC to PROCESS, reloading or restarting the child.
+
+With a live child and an ON-CHANGE hook, call the hook with the old
+and new spec.  A nil result keeps the child and records SPEC, so the
+hook can reload in place.  `:restart' (or t) stops and restarts.
+Other results signal an error and leave SPEC uncommitted.  Without a
+hook, the child restarts whenever SPEC changes."
+  (if (derivation-process-live-p process)
+      (let ((hook (derivation-process-on-change process)))
+        (cond
+         ((null hook)
+          (setf (derivation-process-next-spec process) spec)
+          (derivation--process-request-stop process))
+         (t
+          (pcase (funcall hook (derivation-process-spec process) spec)
+            ('nil
+             (setf (derivation-process-spec process) spec
+                   (derivation-process-next-spec process) nil))
+            ((or :restart 't)
+             (setf (derivation-process-next-spec process) spec)
+             (derivation--process-request-stop process))
+            (result
+             (error "Process :on-change returned %S, expected :restart or nil"
+                    result)))))
+        t)
+    (setf (derivation-process-spec process) spec)
+    (derivation--process-start process spec)
+    t))
+
+(defun derivation--process-apply (process &optional force)
+  "Resolve PROCESS's spec and reconcile.  Return non-nil on change.
+
+FORCE skips the debounce delay; the debounce timer uses it."
   (unless (or (derivation-process-stoppingp process)
               (and (not (derivation-process-desired process))
                    (not (derivation-process-live-p process))
@@ -1164,7 +1189,8 @@ STOPPINGP, and starts NEXT-SPEC when one is pending."
                          (not (derivation-process-restart-timer process)))
                 (derivation--process-start process spec)
                 (setq changed t)))
-             ((and (derivation-process-spec process)
+             ((and (not force)
+                   (derivation-process-spec process)
                    (numberp (derivation-process-debounce process))
                    (> (derivation-process-debounce process) 0))
               (setf (derivation-process-pending-spec process) spec)
@@ -1181,12 +1207,10 @@ STOPPINGP, and starts NEXT-SPEC when one is pending."
              ((derivation-process-live-p process)
               ;; Let the sentinel start SPEC after the old child
               ;; exits: this frees ports and shared resources first.
-              (setf (derivation-process-next-spec process) spec)
-              (derivation--process-request-stop process)
+              (derivation--process-change process spec)
               (setq changed t))
              (t
-              (setf (derivation-process-spec process) spec)
-              (derivation--process-start process spec)
+              (derivation--process-change process spec)
               (setq changed t))))
         (derivation--failed
          (unless (derivation-process-process process)
@@ -1276,7 +1300,8 @@ sentinel after the old child exits."
                                         (backoff '(0.5 1 2 5))
                                         (stop-signal 'SIGTERM)
                                         (stop-timeout 2)
-                                        (debounce 0))
+                                        (debounce 0)
+                                        on-change)
   "Create a long-running child process derived from a live spec.
 
 COMMAND is a non-empty list (PROGRAM ARG...).  Each COMMAND element
@@ -1307,6 +1332,13 @@ starts from the sentinel after the old child exits, so ports and
 shared resources free first.  DEBOUNCE delays SPEC-change restarts
 by that many seconds \(default 0, immediate).
 
+ON-CHANGE is called with the old and new resolved specs when SPEC
+changes while the child runs.  Return nil to keep the child and
+reload it in place (for example with SIGHUP); the new SPEC is then
+recorded.  Return `:restart' (or t) to stop and start it.  Other
+results signal an error and leave the old SPEC.  Without ON-CHANGE
+the default is to restart.
+
 The deriver is registered automatically and reconciles on the
 `derivation-run-hooks' schedule.  The child's stdout and stderr go to
 a hidden log buffer with `derivation-mode-line' support; killing that
@@ -1322,6 +1354,8 @@ inspect it, and `derivation-process-start', `derivation-process-stop'
 and `derivation-process-restart' to control it."
   (unless (and (listp command) command)
     (error "derivation-make-process: COMMAND must be a non-empty list"))
+  (when (and on-change (not (functionp on-change)))
+    (error "derivation-make-process: ON-CHANGE must be a function or nil"))
   (let* ((name (or name
                    (let ((program (car command)))
                      (if (stringp program)
@@ -1345,7 +1379,8 @@ and `derivation-process-restart' to control it."
                   :backoff backoff
                   :stop-signal stop-signal
                   :stop-timeout stop-timeout
-                  :debounce debounce))
+                  :debounce debounce
+                  :on-change on-change))
          (deriver (lambda () (derivation--process-apply handle)))
          (kill-hook (lambda () (derivation-unregister handle))))
     (setf (derivation-process-deriver handle) deriver

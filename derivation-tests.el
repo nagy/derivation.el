@@ -1493,5 +1493,121 @@ the in-place change and triggers recomputation regardless."
         (derivation-test--process-cleanup process))
       (delete-directory dir t))))
 
+(ert-deftest derivation-process-on-change-reloads ()
+  "A nil :on-change result keeps the child and records the new spec."
+  (skip-unless (and (executable-find "sh") (executable-find "sleep")))
+  (let* ((arg "one")
+         (input (derivation-make-input (lambda () arg)))
+         (seen nil)
+         (process nil))
+    (unwind-protect
+        (progn
+          (setq process
+                (derivation-make-process
+                 :name "deriv-test-on-change"
+                 :command (list "sh" "-c" "exec sleep 30" "sh" input)
+                 :on-change (lambda (old new)
+                              (push (list (plist-get old :command)
+                                          (plist-get new :command))
+                                    seen)
+                              nil)))
+          (let ((first (derivation-process-process process)))
+            (setq arg "two")
+            (derivation-input-invalidate input)
+            (derivation-run-hooks)
+            (should (eq (derivation-process-process process) first))
+            (should (process-live-p first))
+            (should (equal (car seen)
+                           '(("sh" "-c" "exec sleep 30" "sh" "one")
+                             ("sh" "-c" "exec sleep 30" "sh" "two"))))
+            (should (equal (plist-get (derivation-process-spec process) :command)
+                           '("sh" "-c" "exec sleep 30" "sh" "two")))
+            (derivation-run-hooks)
+            (should (= (length seen) 1))))
+      (when process
+        (derivation-test--process-cleanup process)))))
+
+(ert-deftest derivation-process-on-change-restarts ()
+  "A :restart :on-change result replaces the child."
+  (skip-unless (and (executable-find "sh") (executable-find "sleep")))
+  (let* ((arg "one")
+         (input (derivation-make-input (lambda () arg)))
+         (calls 0)
+         (process nil))
+    (unwind-protect
+        (progn
+          (setq process
+                (derivation-make-process
+                 :name "deriv-test-on-change-restart"
+                 :command (list "sh" "-c" "exec sleep 30" "sh" input)
+                 :on-change (lambda (_old _new) (cl-incf calls) :restart)))
+          (let ((first (derivation-process-process process)))
+            (setq arg "two")
+            (derivation-input-invalidate input)
+            (derivation-run-hooks)
+            (should (= calls 1))
+            (should (derivation-test--wait-for
+                     (lambda ()
+                       (let ((second (derivation-process-process process)))
+                         (and (not (eq first second))
+                              (process-live-p second))))))
+            (should-not (process-live-p first))))
+      (when process
+        (derivation-test--process-cleanup process)))))
+
+(ert-deftest derivation-process-on-change-invalid-result ()
+  "A bad :on-change result keeps the child and records an error."
+  (skip-unless (and (executable-find "sh") (executable-find "sleep")))
+  (let* ((arg "one")
+         (input (derivation-make-input (lambda () arg)))
+         (process nil))
+    (unwind-protect
+        (progn
+          (setq process
+                (derivation-make-process
+                 :name "deriv-test-on-change-bad"
+                 :command (list "sh" "-c" "exec sleep 30" "sh" input)
+                 :on-change (lambda (_old _new) :bogus)))
+          (let ((first (derivation-process-process process))
+                (old-command (plist-get (derivation-process-spec process)
+                                        :command)))
+            (setq arg "two")
+            (derivation-input-invalidate input)
+            (derivation-run-hooks)
+            (should (eq (derivation-process-process process) first))
+            (should (process-live-p first))
+            (should (string-match-p "on-change"
+                                    (derivation-process-last-error process)))
+            (should (equal (plist-get (derivation-process-spec process) :command)
+                           old-command))))
+      (when process
+        (derivation-test--process-cleanup process)))))
+
+(ert-deftest derivation-process-on-change-after-debounce ()
+  "The hook runs when the debounce timer fires, not before."
+  (skip-unless (and (executable-find "sh") (executable-find "sleep")))
+  (let* ((arg "one")
+         (input (derivation-make-input (lambda () arg)))
+         (calls 0)
+         (process nil))
+    (unwind-protect
+        (progn
+          (setq process
+                (derivation-make-process
+                 :name "deriv-test-on-change-debounce"
+                 :command (list "sh" "-c" "exec sleep 30" "sh" input)
+                 :debounce 0.05
+                 :on-change (lambda (_old _new) (cl-incf calls) nil)))
+          (let ((first (derivation-process-process process)))
+            (setq arg "two")
+            (derivation-input-invalidate input)
+            (derivation-run-hooks)
+            (should (= calls 0))
+            (should (derivation-test--wait-for (lambda () (= calls 1)) 2))
+            (should (eq (derivation-process-process process) first))
+            (should (process-live-p first))))
+      (when process
+        (derivation-test--process-cleanup process)))))
+
 (provide 'derivation-tests)
 ;;; derivation-tests.el ends here

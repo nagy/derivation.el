@@ -19,6 +19,7 @@
 - `derivation-make` takes `(pull-fn push-fn &optional stamp-fn)` — the generic data-deriver primitive. `pull-fn` returns the derived data (a pure scan of global state); `push-fn` renders it and is responsible for selecting its target buffer. Memoized on `equal` of the data (`copy-tree`ed); with `stamp-fn` the pull is skipped while the stamp is unchanged. Does NOT self-register — callers pass the result to `derivation-register`.
 - `derivation-make-input` takes `(pull &optional stamp name)` and returns a `derivation-input`: a memoized live value. `derivation-input-value` pulls only when the stamp changed or after `derivation-input-invalidate`; with no stamp the input pulls once, then only on invalidation. A stamp is a zero-arg function returning an `equal`-comparable value. Stamps compose via `derivation-stamp-or`; helpers: `derivation-stamp-always`, `derivation-stamp-mtime`, `derivation-stamp-files`, `derivation-stamp-git` (HEAD + tracked dirt, untracked files ignored like Nix flakes). Errors signal `derivation--failed`, keep the last good value, and land in `derivation-input-error`.
 - `derivation-make-command-input` takes `(command &key directory environment stamp transform name)`: asynchronous `make-process`, stdout captured, default `transform` is `string-trim`, nonzero exit signals `derivation--failed` with stderr. `derivation-input-value` signals `derivation--pending` while the command runs; `derivation-input-wait` blocks for the value. Environment values must be strings. Use it for one-shot value producers such as `nix build --no-out-link`.
+- `derivation--retry-delay` (default 1s) spaces retries of failed async commands. A failed buffer command or command input starts a new job only after the delay, unless the source tick or input stamp changed. `derivation-rerun` and `derivation-input-invalidate` reset the delay.
 - `derivation-make-process` takes keyword args `:name :command :directory :environment :auto-restart :backoff :stop-signal :stop-timeout :debounce :on-change` and returns a `derivation-process` handle. `:command` is a non-empty list; its elements, `:directory`, and `(VAR . VALUE)` environment values may be strings, `derivation-input`s or functions. Resolution records the inputs it reads. SPEC = resolved `(:command ... :program ... :directory ... :environment ...)`, compared with `equal`: a change asks the old child to stop (STOP-SIGNAL now, SIGKILL after STOP-TIMEOUT) and the sentinel starts the replacement after the old child exits. `:on-change (old new)` runs first while the child lives: nil keeps the child and records the new spec (reload in place), `:restart`/t stops and starts, other values error and leave the old spec. `:program` holds the executable's truename, inode, size and mtime (`derivation--program-stamp`), so replacing or retargeting the binary restarts the child even when argv stays the same. The deriver self-registers and reconciles on `derivation-run-hooks`; `derivation-unregister` accepts the handle. Output goes to a hidden log buffer with `derivation--source`/mode-line support; killing that buffer unregisters. Auto-restart backs off 0.5/1/2/5s and resets after a stable run. STATUS `:stopping` means the exit is in flight.
 - Environment entries resolve to `"VAR=VALUE"` strings or `(VAR)` for unset. The spec stores only these entries; the inherited `process-environment` joins at start, so ambient env changes do not trigger restarts.
 - `derivation--memoizer` also exposes a VALUE closure (dirty check + sync + last data), so `derivation-input` reuses the primitive instead of a second memo implementation. An input folds a generation counter plus its stamp into the memo stamp, so manual invalidation works even with a stamp.
@@ -44,7 +45,7 @@
 ## Known limitations (current session)
 
 - Buffer source derivers poll via idle timer, or — opt-in — via `auto-revert-mode` using the installed `buffer-stale-function`. External string commands and command inputs run asynchronously now, so slow commands no longer freeze Emacs. Async results land on the next `derivation-run-hooks` pass (or `derivation-input-wait` for command inputs).
-- A failing async command retries on every pass, with no cooldown. An abandoned command-input job holds its hidden buffers until a read or process exit.
+- A failed async command retries after `derivation--retry-delay` (default 1s), unless the source tick or input stamp changed. An abandoned command-input job holds its hidden buffers until a read or process exit.
 - `derivation-unregister` and `derivation-process-stop` return before the child exits; the child can outlive the call by up to `:stop-timeout`, then the SIGKILL timer and sentinel finish the state change. `derivation--process-start` is synchronous (`make-process`). Program identity touches the filesystem (and TRAMP) on every process pass.
 - In-place mutations on vectors and hash tables are not caught by `equal` (vectors are handled by `copy-tree cur-val t`; hash tables are not).
 - `derivation--storage` is a double-dash private var; the public API is `derivation-register`/`derivation-unregister`.  Rename the var to `derivation-storage` eventually.
@@ -84,7 +85,7 @@ The `buffer-stale-function` / `revert-buffer-function` integration is the first 
 
 ### Async buffer commands
 
-Done: `derivation--command` wraps `make-process` with a sentinel.  String commands in `derivation-make-deriver` and `derivation-make-command-input` run async, feed stdin through a temp file (seekable), and discard results whose tick went stale.  Remaining: a retry cooldown for failing commands.
+Done: `derivation--command` wraps `make-process` with a sentinel.  String commands in `derivation-make-deriver` and `derivation-make-command-input` run async, feed stdin through a temp file (seekable), discard results whose tick went stale, and space failed retries with `derivation--retry-delay`.
 
 ### replace-buffer-contents
 
@@ -102,10 +103,8 @@ Numbered work items for this project.  **Remove items entirely once finished** (
 
 1. **Wire inputs into existing derivers.** `derivation--make-buffer-deriver` and `derivation-make-var-deriver` still build stamps by hand; a buffer input and a variable input would unify them under `derivation-input` (buffer tick, watcher generation).
 
-2. **Retry cooldown for async commands.** A failing async command starts again on every `derivation-run-hooks` pass. Add a short delay (for example 1s) before retrying a failed job.
-
 ### Cleanup
 
-3. **Test `derivation-mode-line-form-evaluates` tests implementation, not behavior.** It `eval`s `(cadr derivation-mode-line)` directly. A rendering-based test is impossible in the batch suite: `format-mode-line` is a deliberate no-op when `noninteractive` (see `Fformat_mode_line` in xdisp.c), so the rendered string can't be checked under `emacs --batch`. Either keep the eval-based test or move the suite to a display-backed runner.
+2. **Test `derivation-mode-line-form-evaluates` tests implementation, not behavior.** It `eval`s `(cadr derivation-mode-line)` directly. A rendering-based test is impossible in the batch suite: `format-mode-line` is a deliberate no-op when `noninteractive` (see `Fformat_mode_line` in xdisp.c), so the rendered string can't be checked under `emacs --batch`. Either keep the eval-based test or move the suite to a display-backed runner.
 
-4. **Minor: stderr capture.** `with-temp-buffer` + `insert-file-contents` for stderr could be a single `insert-file-contents` into a reused buffer.
+3. **Minor: stderr capture.** `with-temp-buffer` + `insert-file-contents` for stderr could be a single `insert-file-contents` into a reused buffer.

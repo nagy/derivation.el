@@ -1199,6 +1199,61 @@ the in-place change and triggers recomputation regardless."
     (should-error (derivation-input-value input) :type 'derivation--pending)
     (should (equal (derivation-input-wait input 3) "hi"))))
 
+(ert-deftest derivation-async-retry-cooldown ()
+  "A failed command waits before starting another job."
+  (skip-unless (executable-find "sh"))
+  (let* ((dir (file-name-as-directory (make-temp-file "deriv-retry-" t)))
+         (counter (expand-file-name "count" dir))
+         (bufs (derivation-test--with-buffers "x"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (derivation--retry-delay 0.3)
+         (deriver (derivation-make-deriver
+                   "sh" src dst "-c"
+                   (format "printf x >> %s; exit 1" counter))))
+    (unwind-protect
+        (progn
+          (should (derivation-test--run-until
+                   (lambda () (with-current-buffer dst derivation--error))))
+          (should (= (file-attribute-size (file-attributes counter)) 1))
+          ;; Inside the cooldown no new job starts and staleness is quiet.
+          (derivation-run-hooks)
+          (accept-process-output nil 0.05)
+          (should (= (file-attribute-size (file-attributes counter)) 1))
+          (with-current-buffer dst
+            (should-not (funcall buffer-stale-function t)))
+          ;; After the cooldown the command runs again.
+          (sleep-for 0.5)
+          (with-current-buffer dst
+            (should (funcall buffer-stale-function t)))
+          (derivation-run-hooks)
+          (should (derivation-test--run-until
+                   (lambda ()
+                     (= (file-attribute-size (file-attributes counter)) 2)))))
+      (derivation-unregister deriver)
+      (derivation-test--kill-buffers (list bufs))
+      (delete-directory dir t))))
+
+(ert-deftest derivation-command-input-retry-cooldown ()
+  "A failed command input waits before starting another job."
+  (skip-unless (executable-find "sh"))
+  (let* ((dir (file-name-as-directory (make-temp-file "deriv-retry-in-" t)))
+         (counter (expand-file-name "count" dir))
+         (derivation--retry-delay 0.3)
+         (input (derivation-make-command-input
+                 (list "sh" "-c"
+                       (format "printf x >> %s; exit 1" counter)))))
+    (unwind-protect
+        (progn
+          (should-error (derivation-input-wait input) :type 'derivation--failed)
+          (should (= (file-attribute-size (file-attributes counter)) 1))
+          (should-error (derivation-input-value input) :type 'derivation--pending)
+          (should (= (file-attribute-size (file-attributes counter)) 1))
+          (sleep-for 0.5)
+          (should-error (derivation-input-wait input) :type 'derivation--failed)
+          (should (= (file-attribute-size (file-attributes counter)) 2)))
+      (delete-directory dir t))))
+
 (ert-deftest derivation-command-input-directory ()
   "A command input runs in its DIRECTORY."
   (skip-unless (executable-find "sh"))

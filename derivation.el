@@ -225,6 +225,9 @@ Read-only is bypassed, as the previous sink did."
   "Inputs seen by the current spec resolution.
 Bound by `derivation--resolve-spec'.")
 
+(defvar derivation--retry-delay 1.0
+  "Seconds to wait before retrying a failed asynchronous command.")
+
 ;;; Asynchronous external commands
 
 (cl-defstruct (derivation--command (:constructor derivation--command-create)
@@ -613,6 +616,8 @@ STAMP so the command runs only when its inputs change."
          (input (derivation--input-create
                  :name name :stamp stamp :generation 0))
          (job nil)
+         (retry-at nil)
+         (retry-stamp nil)
          (kill-job
           (lambda ()
             (when job
@@ -630,6 +635,15 @@ STAMP so the command runs only when its inputs change."
                     (derivation--command-environment environment))))
               (setq job (derivation--command-start
                          (car command) (cdr command) nil current)))))
+         (start-new
+          (lambda (current)
+            (if (and retry-at
+                     (time-less-p (current-time) retry-at)
+                     (equal retry-stamp current))
+                (signal 'derivation--pending nil)
+              (setq retry-at nil retry-stamp nil)
+              (funcall start-job current)
+              (signal 'derivation--pending nil))))
          (pull
           (lambda ()
             (let ((current (funcall effective-stamp)))
@@ -638,16 +652,21 @@ STAMP so the command runs only when its inputs change."
                 (if (equal (derivation--command-tick job) current)
                     (let ((done job))
                       (setq job nil)
-                      (funcall transform (derivation--command-consume done)))
+                      (condition-case err
+                          (funcall transform (derivation--command-consume done))
+                        (derivation--failed
+                         (setq retry-at (time-add
+                                         (current-time)
+                                         derivation--retry-delay)
+                               retry-stamp current)
+                         (signal 'derivation--failed (cdr err)))))
                   (funcall kill-job)
-                  (funcall start-job current)
-                  (signal 'derivation--pending nil)))
+                  (funcall start-new current)))
                ((and job (equal (derivation--command-tick job) current))
                 (signal 'derivation--pending nil))
                (t
                 (funcall kill-job)
-                (funcall start-job current)
-                (signal 'derivation--pending nil)))))))
+                (funcall start-new current)))))))
     (setf (derivation-input-pull input) pull
           (derivation-input-memo input)
           (derivation--memoizer pull #'ignore effective-stamp))
@@ -731,11 +750,17 @@ before it finishes."
       (error "derivation-make-deriver: source buffer is not live"))
     (if (stringp command)
         (let* ((job nil)
+               (retry-at nil)
+               (retry-tick nil)
                (kill-job
                 (lambda ()
                   (when job
                     (derivation--command-kill job)
                     (setq job nil))))
+               (reset
+                (lambda ()
+                  (funcall kill-job)
+                  (setq retry-at nil retry-tick nil)))
                (start-job
                 (lambda ()
                   (let ((tick (buffer-chars-modified-tick buf))
@@ -744,6 +769,16 @@ before it finishes."
                                     (point-min) (point-max)))))
                     (setq job (derivation--command-start
                                command args content tick)))))
+               (start-new
+                (lambda ()
+                  (let ((tick (buffer-chars-modified-tick buf)))
+                    (if (and retry-at
+                             (time-less-p (current-time) retry-at)
+                             (equal retry-tick tick))
+                        (signal 'derivation--pending nil)
+                      (setq retry-at nil retry-tick nil)
+                      (funcall start-job)
+                      (signal 'derivation--pending nil)))))
                (pull
                 (lambda ()
                   (cond
@@ -755,22 +790,24 @@ before it finishes."
                           (condition-case err
                               (derivation--command-consume done)
                             (derivation--failed
+                             (setq retry-at (time-add
+                                             (current-time)
+                                             derivation--retry-delay)
+                                   retry-tick (derivation--command-tick done))
                              (let ((msg (or (cadr err)
                                             (error-message-string err))))
                                (with-current-buffer tbuf
                                  (setq-local derivation--error msg)))
                              (signal 'derivation--failed (cdr err)))))
                       (funcall kill-job)
-                      (funcall start-job)
-                      (signal 'derivation--pending nil)))
+                      (funcall start-new)))
                    ((and job
                          (equal (derivation--command-tick job)
                                 (buffer-chars-modified-tick buf)))
                     (signal 'derivation--pending nil))
                    (t
                     (funcall kill-job)
-                    (funcall start-job)
-                    (signal 'derivation--pending nil)))))
+                    (funcall start-new)))))
                (push-fn
                 (lambda (text)
                   (with-current-buffer tbuf
@@ -778,11 +815,14 @@ before it finishes."
                     (setq-local derivation--error nil)))))
           (derivation--make-buffer-deriver
            buf tbuf pull push-fn
-           kill-job
+           reset
            (lambda ()
-             (and job
-                  (equal (derivation--command-tick job)
-                         (buffer-chars-modified-tick buf))))
+             (let ((tick (buffer-chars-modified-tick buf)))
+               (or (and job
+                        (equal (derivation--command-tick job) tick))
+                   (and retry-at
+                        (time-less-p (current-time) retry-at)
+                        (equal retry-tick tick)))))
            kill-job))
       ;; Function transform: synchronous.
       (let ((errbuf nil))

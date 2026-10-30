@@ -90,13 +90,15 @@
                 # 2–5 sentences: what it does, how (which Emacs primitives /
                 # external services), and any notable modes of operation.
                 longDescription = ''
-                  A minor Emacs Lisp library for creating derived buffers and
-                  live variable derivations: pipe the content of one buffer
-                  through an external command or function into another buffer,
-                  or derive one variable's value from another's.
+                  A minor Emacs Lisp library for creating derived buffers, live
+                  variable derivations and long-running child processes: pipe the
+                  content of one buffer through an external command or function
+                  into another buffer, derive one variable's value from another's,
+                  or restart a server whenever the live values that build its
+                  command, working directory or environment change.
 
-                  Results are memoized per source-buffer tick (or variable
-                  watcher generation), so derivations can run often without
+                  Results are memoized per source-buffer tick, variable watcher
+                  generation or input stamp, so derivations can run often without
                   performance impact. On command failure the target keeps its
                   last good output; errors are shown via a mode-line indicator.
                 '';

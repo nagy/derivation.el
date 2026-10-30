@@ -1179,5 +1179,246 @@ the in-place change and triggers recomputation regardless."
           (should (equal (derivation-input-value input) "two")))
       (delete-file file))))
 
+;;; Process derivation tests
+
+(defun derivation-test--wait-for (predicate &optional timeout)
+  "Pump process output until PREDICATE returns non-nil or TIMEOUT."
+  (let ((deadline (time-add (current-time) (or timeout 3))))
+    (while (and (not (funcall predicate))
+                (time-less-p (current-time) deadline))
+      (accept-process-output nil 0.05))
+    (funcall predicate)))
+
+(defun derivation-test--process-cleanup (process)
+  "Unregister PROCESS and kill its log buffer."
+  (ignore-errors (derivation-unregister process))
+  (let ((log (derivation-process-log process)))
+    (when (buffer-live-p log)
+      (kill-buffer log))))
+
+(defun derivation-test--file-contents (file)
+  "Return FILE's contents, or nil when FILE does not exist."
+  (when (file-exists-p file)
+    (with-temp-buffer
+      (insert-file-contents file)
+      (buffer-string))))
+
+(ert-deftest derivation-process-basic ()
+  "The constructor starts a child, registers a deriver and makes a log."
+  (skip-unless (and (executable-find "sh") (executable-find "sleep")))
+  (let ((before (length derivation--storage))
+        (process nil))
+    (unwind-protect
+        (progn
+          (setq process (derivation-make-process
+                         :name "deriv-test-basic"
+                         :command '("sh" "-c" "exec sleep 30")))
+          (should (derivation-process-p process))
+          (should (eq (derivation-process-status process) :running))
+          (should (derivation-process-live-p process))
+          (should (= (length derivation--storage) (1+ before)))
+          (should (buffer-live-p (derivation-process-log process)))
+          (with-current-buffer (derivation-process-log process)
+            (should (equal (car derivation--source) "deriv-test-basic"))))
+      (when process
+        (derivation-test--process-cleanup process)))
+    (should (= (length derivation--storage) before))))
+
+(ert-deftest derivation-process-restarts-on-input-change ()
+  "A changed input changes the resolved argv and restarts the child."
+  (skip-unless (and (executable-find "sh") (executable-find "sleep")))
+  (let* ((arg "one")
+         (input (derivation-make-input (lambda () arg)))
+         (process nil))
+    (unwind-protect
+        (progn
+          (setq process (derivation-make-process
+                         :name "deriv-test-input-change"
+                         :command (list "sh" "-c" "exec sleep 30" "sh" input)))
+          (let ((first (derivation-process-process process)))
+            (should (process-live-p first))
+            (should (equal (process-command first)
+                           '("sh" "-c" "exec sleep 30" "sh" "one")))
+            (setq arg "two")
+            (derivation-input-invalidate input)
+            (derivation-run-hooks)
+            (let ((second (derivation-process-process process)))
+              (should-not (eq first second))
+              (should (process-live-p second))
+              (should-not (process-live-p first))
+              (should (equal (process-command second)
+                             '("sh" "-c" "exec sleep 30" "sh" "two"))))))
+      (when process
+        (derivation-test--process-cleanup process)))))
+
+(ert-deftest derivation-process-stop-and-start ()
+  "Stop disables and kills the child; start re-enables it."
+  (skip-unless (and (executable-find "sh") (executable-find "sleep")))
+  (let ((process nil))
+    (unwind-protect
+        (progn
+          (setq process (derivation-make-process
+                         :name "deriv-test-stop-start"
+                         :command '("sh" "-c" "exec sleep 30")))
+          (derivation-process-stop process)
+          (should-not (derivation-process-live-p process))
+          (should (eq (derivation-process-status process) :stopped))
+          (derivation-run-hooks)
+          (should-not (derivation-process-live-p process))
+          (derivation-process-start process)
+          (should (derivation-process-live-p process))
+          (should (eq (derivation-process-status process) :running)))
+      (when process
+        (derivation-test--process-cleanup process)))))
+
+(ert-deftest derivation-process-unregister-stops ()
+  "Unregistering the handle stops the child and drops the deriver."
+  (skip-unless (and (executable-find "sh") (executable-find "sleep")))
+  (let* ((process (derivation-make-process
+                   :name "deriv-test-unregister"
+                   :command '("sh" "-c" "exec sleep 30")))
+         (deriver (derivation-process-deriver process)))
+    (derivation-unregister process)
+    (should-not (derivation-process-live-p process))
+    (should-not (assq deriver derivation--storage))
+    (derivation-test--process-cleanup process)))
+
+(ert-deftest derivation-process-log-kill-stops ()
+  "Killing the log buffer unregisters the deriver and stops the child."
+  (skip-unless (and (executable-find "sh") (executable-find "sleep")))
+  (let* ((process (derivation-make-process
+                   :name "deriv-test-log-kill"
+                   :command '("sh" "-c" "exec sleep 30")))
+         (deriver (derivation-process-deriver process)))
+    (kill-buffer (derivation-process-log process))
+    (should-not (derivation-process-live-p process))
+    (should-not (assq deriver derivation--storage))
+    (derivation-test--process-cleanup process)))
+
+(ert-deftest derivation-process-no-restart-on-crash ()
+  "With auto-restart nil, an exited child stays dead and reports status."
+  (skip-unless (executable-find "sh"))
+  (let ((process nil))
+    (unwind-protect
+        (progn
+          (setq process (derivation-make-process
+                         :name "deriv-test-crash"
+                         :command '("sh" "-c" "exit 3")
+                         :auto-restart nil))
+          (should (derivation-test--wait-for
+                   (lambda ()
+                     (eq (derivation-process-status process) :exited))))
+          (should (equal (derivation-process-exit-status process) 3))
+          (should (derivation-process-last-error process))
+          (derivation-run-hooks)
+          (should-not (derivation-process-live-p process)))
+      (when process
+        (derivation-test--process-cleanup process)))))
+
+(ert-deftest derivation-process-restarts-on-crash ()
+  "Auto-restart brings an unexpectedly killed child back."
+  (skip-unless (and (executable-find "sh") (executable-find "sleep")))
+  (let ((process nil))
+    (unwind-protect
+        (progn
+          (setq process (derivation-make-process
+                         :name "deriv-test-crash-restart"
+                         :command '("sh" "-c" "exec sleep 30")
+                         :backoff '(0.05)))
+          (let ((first (derivation-process-process process)))
+            (signal-process first 'SIGKILL)
+            (should (derivation-test--wait-for
+                     (lambda ()
+                       (let ((current (derivation-process-process process)))
+                         (and (not (eq first current))
+                              (process-live-p current))))))
+            (should (derivation-process-live-p process))
+            (should (>= (derivation-process-restart-count process) 1))))
+      (when process
+        (derivation-test--process-cleanup process)))))
+
+(ert-deftest derivation-process-debounce-defers-restart ()
+  "A debounced spec change keeps the old child until the timer fires."
+  (skip-unless (and (executable-find "sh") (executable-find "sleep")))
+  (let* ((arg "one")
+         (input (derivation-make-input (lambda () arg)))
+         (process nil))
+    (unwind-protect
+        (progn
+          (setq process (derivation-make-process
+                         :name "deriv-test-debounce"
+                         :command (list "sh" "-c" "exec sleep 30" "sh" input)
+                         :debounce 5))
+          (let ((first (derivation-process-process process)))
+            (setq arg "two")
+            (derivation-input-invalidate input)
+            (derivation-run-hooks)
+            (should (eq (derivation-process-process process) first))
+            (should (process-live-p first))
+            (should (derivation-process-pending-spec process))
+            (derivation-process-stop process)
+            (should-not (derivation-process-pending-spec process))
+            (should-not (derivation-process-timer process))
+            (sleep-for 0.1)
+            (should-not (derivation-process-live-p process))))
+      (when process
+        (derivation-test--process-cleanup process)))))
+
+(ert-deftest derivation-process-input-failure-keeps-running ()
+  "A failing input keeps the old child running and records the error."
+  (skip-unless (and (executable-find "sh") (executable-find "sleep")))
+  (let* ((fail nil)
+         (input (derivation-make-input
+                 (lambda ()
+                   (if fail
+                       (signal 'derivation--failed (list "boom"))
+                     "one"))))
+         (process nil))
+    (unwind-protect
+        (progn
+          (setq process (derivation-make-process
+                         :name "deriv-test-input-failure"
+                         :command (list "sh" "-c" "exec sleep 30" "sh" input)))
+          (let ((first (derivation-process-process process)))
+            (setq fail t)
+            (derivation-input-invalidate input)
+            (derivation-run-hooks)
+            (should (eq (derivation-process-process process) first))
+            (should (process-live-p first))
+            (should (equal (derivation-process-last-error process) "boom"))
+            (with-current-buffer (derivation-process-log process)
+              (should (equal derivation--error "boom")))
+            (setq fail nil)
+            (derivation-input-invalidate input)
+            (derivation-run-hooks)
+            (should-not (derivation-process-last-error process))
+            (with-current-buffer (derivation-process-log process)
+              (should-not derivation--error))))
+      (when process
+        (derivation-test--process-cleanup process)))))
+
+(ert-deftest derivation-process-directory-and-environment ()
+  "Inputs resolve for the working directory and the environment."
+  (skip-unless (and (executable-find "sh") (executable-find "sleep")))
+  (let* ((dir (file-name-as-directory (make-temp-file "deriv-proc-dir-" t)))
+         (out (expand-file-name "out" dir))
+         (dir-input (derivation-make-input (lambda () dir)))
+         (value-input (derivation-make-input (lambda () "hello")))
+         (process nil))
+    (unwind-protect
+        (progn
+          (setq process (derivation-make-process
+                         :name "deriv-test-dir-env"
+                         :command '("sh" "-c"
+                                    "printf %s \"$DERIV_VAR\" > out; exec sleep 30")
+                         :directory dir-input
+                         :environment (list (cons "DERIV_VAR" value-input))))
+          (should (derivation-test--wait-for
+                   (lambda ()
+                     (equal (derivation-test--file-contents out) "hello")))))
+      (when process
+        (derivation-test--process-cleanup process))
+      (delete-directory dir t))))
+
 (provide 'derivation-tests)
 ;;; derivation-tests.el ends here

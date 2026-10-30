@@ -65,6 +65,13 @@
 ;;   (derivation-input-value my-docs)        ; => "/nix/store/...-cargo-doc"
 ;;   (derivation-input-invalidate my-docs)   ; force a rebuild next read
 ;;
+;;   ;; A long-running server, restarted when the docs path changes.
+;;   (defvar my-docs-server
+;;     (derivation-make-process
+;;      :name "docs-http"
+;;      :command (list "darkhttpd" my-docs "--port" "8081")
+;;      :directory my-docs))
+;;
 ;;   ;; Run derivations on idle.
 ;;   (run-with-idle-timer 0.1 t #'derivation-run-hooks)
 ;;
@@ -99,6 +106,24 @@ it is called by `derivation-unregister'.
 Never manipulate this list directly: use `derivation-register' and
 `derivation-unregister'.")
 
+(cl-defstruct (derivation-process (:constructor derivation--process-create)
+                                   (:copier nil))
+  "A long-running child process reconciled against a live spec.
+COMMAND, DIRECTORY and ENVIRONMENT hold unresolved spec forms
+(strings, `derivation-input's or functions).  SPEC holds the
+resolved runtime spec of the current or last process;
+PENDING-SPEC holds a debounced change.  DERIVER is the function
+registered with `derivation-run-hooks'.  AUTO-RESTART, BACKOFF,
+STOP-SIGNAL, STOP-TIMEOUT and DEBOUNCE are policy options.
+STATUS is one of `:running', `:exited', `:stopped' or `:failed'."
+  name command directory environment
+  spec pending-spec inputs
+  log deriver process
+  desired status
+  auto-restart backoff stop-signal stop-timeout debounce
+  timer restart-timer restart-count started-at stoppingp
+  last-error kill-hook)
+
 (defun derivation-register (deriver &optional cleanup)
   "Register DERIVER so `derivation-run-hooks' runs it.
 
@@ -114,10 +139,13 @@ Returns DERIVER."
 
 (defun derivation-unregister (deriver)
   "Remove DERIVER from `derivation--storage'.
+DERIVER is a deriver function or a `derivation-process' handle.
 Deriver records are also removed automatically when their source or
 target buffer is killed; this is for manual teardown.
 
 Returns non-nil if DERIVER was registered."
+  (when (derivation-process-p deriver)
+    (setq deriver (derivation-process-deriver deriver)))
   (let ((removed (assq deriver derivation--storage)))
     (when removed
       (setq derivation--storage (delq removed derivation--storage))
@@ -799,6 +827,465 @@ This sets TBUF's buffer-local `buffer-stale-function' and
                 (lambda (&optional _noconfirm) (funcall dirtyp)))
     (setq-local revert-buffer-function
                 (lambda (&rest _) (funcall run) t))))
+
+;;; Process derivation
+
+(defvar derivation--resolving-inputs nil
+  "Inputs seen by the current spec resolution.
+Bound by `derivation--resolve-spec'.")
+
+(defun derivation-process-live-p (process)
+  "Return non-nil when PROCESS has a live child."
+  (let ((proc (derivation-process-process process)))
+    (and proc (process-live-p proc))))
+
+(defun derivation-process-exit-status (process)
+  "Return the exit status of PROCESS's last child, or nil."
+  (let ((proc (derivation-process-process process)))
+    (when proc (process-exit-status proc))))
+
+(defun derivation--process-set-error (process message)
+  "Record MESSAGE as PROCESS's error, buffer-locally in its log."
+  (setf (derivation-process-last-error process) message)
+  (let ((log (derivation-process-log process)))
+    (when (buffer-live-p log)
+      (with-current-buffer log
+        (setq-local derivation--error message)))))
+
+(defun derivation--process-clear-error (process)
+  "Clear PROCESS's error state."
+  (setf (derivation-process-last-error process) nil)
+  (let ((log (derivation-process-log process)))
+    (when (buffer-live-p log)
+      (with-current-buffer log
+        (setq-local derivation--error nil)))))
+
+(defun derivation--process-cancel-timer (process)
+  "Cancel PROCESS's debounce timer and any pending spec."
+  (let ((timer (derivation-process-timer process)))
+    (when timer
+      (cancel-timer timer)))
+  (setf (derivation-process-timer process) nil
+        (derivation-process-pending-spec process) nil))
+
+(defun derivation--process-cancel-restart-timer (process)
+  "Cancel PROCESS's crash-backoff timer."
+  (let ((timer (derivation-process-restart-timer process)))
+    (when timer
+      (cancel-timer timer)))
+  (setf (derivation-process-restart-timer process) nil))
+
+(defun derivation--process-backoff-cap (process)
+  "Return the longest backoff delay of PROCESS, in seconds."
+  (float (or (car (last (derivation-process-backoff process))) 5)))
+
+(defun derivation--process-reset-backoff-if-stable (process)
+  "Reset PROCESS's backoff after a run longer than its cap."
+  (let ((started (derivation-process-started-at process)))
+    (when (and started
+               (>= (float-time (time-since started))
+                   (derivation--process-backoff-cap process)))
+      (setf (derivation-process-restart-count process) 0))))
+
+(defun derivation--process-schedule-restart (process)
+  "Schedule PROCESS's next crash restart with backoff."
+  (unless (derivation-process-restart-timer process)
+    (let* ((backoff (or (derivation-process-backoff process)
+                        '(0.5 1 2 5)))
+           (index (min (derivation-process-restart-count process)
+                       (1- (length backoff))))
+           (delay (nth index backoff)))
+      (cl-incf (derivation-process-restart-count process))
+      (setf (derivation-process-restart-timer process)
+            (run-at-time delay nil
+                         (lambda ()
+                           (setf (derivation-process-restart-timer process) nil)
+                           (when (and (derivation-process-desired process)
+                                      (not (derivation-process-stoppingp process)))
+                             (derivation--process-apply process))))))))
+
+(defun derivation--resolve-value (form)
+  "Resolve FORM to a value, recording the inputs it reads."
+  (cond
+   ((derivation-input-p form)
+    (push form derivation--resolving-inputs)
+    (derivation-input-value form))
+   ((functionp form)
+    (derivation--resolve-value (funcall form)))
+   (t form)))
+
+(defun derivation--resolve-command (forms)
+  "Resolve FORMS into a command list of strings."
+  (unless (and (listp forms) forms)
+    (error "Process command must be a non-empty list, got %S" forms))
+  (let ((command (mapcar #'derivation--resolve-value forms)))
+    (dolist (arg command)
+      (unless (stringp arg)
+        (error "Process command element did not resolve to a string: %S" arg)))
+    command))
+
+(defun derivation--resolve-directory (process)
+  "Resolve PROCESS's working directory."
+  (let ((directory (derivation--resolve-value
+                    (derivation-process-directory process))))
+    (unless (stringp directory)
+      (error "Process directory did not resolve to a string: %S" directory))
+    (file-name-as-directory (expand-file-name directory))))
+
+(defun derivation--resolve-environment (forms)
+  "Resolve FORMS into environment entries.
+
+FORMS is a list of \"VAR=VALUE\" strings or (VAR . VALUE) conses.
+Each entry resolves to a \"VAR=VALUE\" string, or to (VAR) when VALUE
+is nil: the variable is then removed from the inherited environment."
+  (let ((entries nil))
+    (dolist (entry forms)
+      (cond
+       ((stringp entry)
+        (push entry entries))
+       ((consp entry)
+        (let ((var (format "%s" (car entry)))
+              (value (derivation--resolve-value (cdr entry))))
+          (push (if value
+                    (concat var "=" (format "%s" value))
+                  (list var))
+                entries)))
+       (t
+        (error "Bad process environment entry: %S" entry))))
+    (nreverse entries)))
+
+(defun derivation--process-environment (entries)
+  "Build `process-environment' from resolved ENTRIES.
+
+ENTRIES shadows inherited variables of the same name.  An (VAR) entry
+removes VAR from the inherited environment."
+  (let ((inherited process-environment)
+        (additions nil)
+        (names nil))
+    (dolist (entry entries)
+      (if (stringp entry)
+          (progn
+            (push entry additions)
+            (push (substring entry 0 (or (string-match "=" entry)
+                                         (length entry)))
+                  names))
+        (push (car entry) names)))
+    (dolist (name names)
+      (setq inherited
+            (cl-remove-if (lambda (entry)
+                            (string-prefix-p (concat name "=") entry))
+                          inherited)))
+    (append (nreverse additions) inherited)))
+
+(defun derivation--resolve-spec (process)
+  "Resolve PROCESS's spec.  Return (SPEC . INPUTS)."
+  (let* ((derivation--resolving-inputs nil)
+         (spec (list :command
+                     (derivation--resolve-command
+                      (derivation-process-command process))
+                     :directory
+                     (derivation--resolve-directory process)
+                     :environment
+                     (derivation--resolve-environment
+                      (derivation-process-environment process))))
+         (inputs (cl-delete-duplicates
+                  (nreverse derivation--resolving-inputs) :test #'eq)))
+    (cons spec inputs)))
+
+(defun derivation--process-start (process spec)
+  "Start PROCESS's child from SPEC.  Return non-nil on success."
+  (let ((command (plist-get spec :command))
+        (directory (plist-get spec :directory))
+        (environment (plist-get spec :environment))
+        (log (derivation-process-log process)))
+    (derivation--process-cancel-restart-timer process)
+    (condition-case err
+        (progn
+          (when (buffer-live-p log)
+            (with-current-buffer log
+              (goto-char (point-max))
+              (insert (format "\n;; %s starting %S\n"
+                              (format-time-string "%F %T") command))))
+          (let ((default-directory directory)
+                (process-environment
+                 (derivation--process-environment environment)))
+            (setf (derivation-process-process process)
+                  (make-process
+                   :name (derivation-process-name process)
+                   :command command
+                   :buffer log
+                   :stderr log
+                   :coding 'utf-8-unix
+                   :connection-type 'pipe
+                   :noquery t
+                   :sentinel
+                   (lambda (proc event)
+                     (derivation--process-sentinel process proc event)))))
+          (setf (derivation-process-status process) :running
+                (derivation-process-started-at process) (current-time)
+                (derivation-process-stoppingp process) nil
+                (derivation-process-pending-spec process) nil)
+          (derivation--process-clear-error process)
+          t)
+      (error
+       (let ((message (error-message-string err)))
+         (setf (derivation-process-status process) :failed)
+         (derivation--process-set-error process message)
+         (when (derivation-process-auto-restart process)
+           (derivation--process-schedule-restart process))
+         nil)))))
+
+(defun derivation--process-stop (process)
+  "Stop PROCESS's child: SIGTERM, bounded wait, then SIGKILL."
+  (let ((proc (derivation-process-process process)))
+    (when (and proc (process-live-p proc))
+      (setf (derivation-process-stoppingp process) t)
+      (unwind-protect
+          (progn
+            (ignore-errors
+              (signal-process proc (or (derivation-process-stop-signal process)
+                                       'SIGTERM)))
+            (let ((deadline (time-add
+                             (current-time)
+                             (or (derivation-process-stop-timeout process) 2))))
+              (while (and (process-live-p proc)
+                          (time-less-p (current-time) deadline))
+                (accept-process-output proc 0.05)))
+            (when (process-live-p proc)
+              (ignore-errors (signal-process proc 'SIGKILL))
+              (let ((deadline (time-add (current-time) 1)))
+                (while (and (process-live-p proc)
+                            (time-less-p (current-time) deadline))
+                  (accept-process-output proc 0.05)))))
+        (setf (derivation-process-stoppingp process) nil)))
+    (setf (derivation-process-status process) :stopped)))
+
+(defun derivation--process-sentinel (process proc event)
+  "Handle PROC's exit for PROCESS.  EVENT is the sentinel string."
+  (when (and (not (derivation-process-stoppingp process))
+             (eq proc (derivation-process-process process))
+             (not (process-live-p proc)))
+    (if (derivation-process-desired process)
+        (progn
+          (setf (derivation-process-status process) :exited)
+          (unless (equal (process-exit-status proc) 0)
+            (derivation--process-set-error
+             process
+             (format "%s: %s" (derivation-process-name process)
+                     (string-trim event))))
+          (when (derivation-process-auto-restart process)
+            (derivation--process-reset-backoff-if-stable process)
+            (derivation--process-schedule-restart process)))
+      (setf (derivation-process-status process) :stopped))))
+
+(defun derivation--process-fire-pending (process)
+  "Start PROCESS's pending spec, if any."
+  (let ((pending (derivation-process-pending-spec process)))
+    (when pending
+      (setf (derivation-process-pending-spec process) nil)
+      (when (derivation-process-live-p process)
+        (derivation--process-stop process))
+      (setf (derivation-process-spec process) pending)
+      (derivation--process-start process pending))))
+
+(defun derivation--process-apply (process)
+  "Resolve PROCESS's spec and reconcile.  Return non-nil on change."
+  (unless (or (derivation-process-stoppingp process)
+              (and (not (derivation-process-desired process))
+                   (not (derivation-process-live-p process))
+                   (not (derivation-process-pending-spec process))))
+    (let ((changed nil))
+      (condition-case err
+          (pcase-let ((`(,spec . ,inputs) (derivation--resolve-spec process)))
+            (setf (derivation-process-inputs process) inputs)
+            (when (derivation-process-live-p process)
+              (derivation--process-clear-error process))
+            (cond
+             ((not (derivation-process-desired process))
+              (when (derivation-process-live-p process)
+                (derivation--process-stop process)
+                (setq changed t)))
+             ((and (derivation-process-pending-spec process)
+                   (equal spec (derivation-process-spec process)))
+              ;; The spec returned to the running one before the
+              ;; debounce fired: drop the pending restart.
+              (derivation--process-cancel-timer process)
+              (setq changed t))
+             ((equal spec (derivation-process-spec process))
+              (when (and (derivation-process-auto-restart process)
+                         (not (derivation-process-live-p process))
+                         (not (derivation-process-restart-timer process)))
+                (derivation--process-start process spec)
+                (setq changed t)))
+             ((and (derivation-process-spec process)
+                   (numberp (derivation-process-debounce process))
+                   (> (derivation-process-debounce process) 0))
+              (setf (derivation-process-pending-spec process) spec)
+              (let ((timer nil))
+                (setq timer
+                      (run-at-time
+                       (derivation-process-debounce process) nil
+                       (lambda ()
+                         (when (eq timer (derivation-process-timer process))
+                           (setf (derivation-process-timer process) nil)
+                           (derivation--process-fire-pending process)))))
+                (setf (derivation-process-timer process) timer))
+              (setq changed t))
+             (t
+              (when (derivation-process-live-p process)
+                (derivation--process-stop process))
+              (setf (derivation-process-spec process) spec)
+              (derivation--process-start process spec)
+              (setq changed t))))
+        (derivation--failed
+         (unless (derivation-process-process process)
+           (setf (derivation-process-status process) :failed))
+         (derivation--process-set-error
+          process (or (cadr err) (error-message-string err))))
+        (error
+         (unless (derivation-process-process process)
+           (setf (derivation-process-status process) :failed))
+         (derivation--process-set-error process (error-message-string err))))
+      changed)))
+
+(defun derivation--process-teardown (process)
+  "Release PROCESS's timers, child and log-buffer hooks."
+  (setf (derivation-process-desired process) nil)
+  (derivation--process-cancel-timer process)
+  (derivation--process-cancel-restart-timer process)
+  (derivation--process-stop process)
+  (let ((log (derivation-process-log process))
+        (hook (derivation-process-kill-hook process)))
+    (when (buffer-live-p log)
+      (with-current-buffer log
+        (when hook
+          (remove-hook 'kill-buffer-hook hook t))
+        (setq-local derivation--source nil)
+        (setq-local buffer-stale-function nil)
+        (setq-local revert-buffer-function nil)))))
+
+(defun derivation-process-start (process)
+  "Enable PROCESS and start its child now, resolving the spec."
+  (derivation--process-cancel-timer process)
+  (derivation--process-cancel-restart-timer process)
+  (setf (derivation-process-desired process) t)
+  (unless (derivation-process-live-p process)
+    (pcase-let ((`(,spec . ,inputs) (derivation--resolve-spec process)))
+      (setf (derivation-process-inputs process) inputs
+            (derivation-process-spec process) spec)
+      (derivation--process-start process spec)))
+  process)
+
+(defun derivation-process-stop (process)
+  "Disable PROCESS and stop its child.
+
+A later `derivation-process-start' re-enables it.  The process deriver
+leaves it stopped while it is disabled."
+  (setf (derivation-process-desired process) nil)
+  (derivation--process-cancel-timer process)
+  (derivation--process-cancel-restart-timer process)
+  (derivation--process-stop process)
+  process)
+
+(defun derivation-process-restart (process)
+  "Stop PROCESS and start it again from a freshly resolved spec."
+  (setf (derivation-process-desired process) t)
+  (derivation--process-cancel-timer process)
+  (derivation--process-cancel-restart-timer process)
+  (when (derivation-process-live-p process)
+    (derivation--process-stop process))
+  (pcase-let ((`(,spec . ,inputs) (derivation--resolve-spec process)))
+    (setf (derivation-process-inputs process) inputs
+          (derivation-process-spec process) spec)
+    (derivation--process-start process spec))
+  process)
+
+;;;###autoload
+(cl-defun derivation-make-process (&key name command directory environment
+                                        (auto-restart t)
+                                        (backoff '(0.5 1 2 5))
+                                        (stop-signal 'SIGTERM)
+                                        (stop-timeout 2)
+                                        (debounce 0))
+  "Create a long-running child process derived from a live spec.
+
+COMMAND is a non-empty list (PROGRAM ARG...).  Each COMMAND element
+may be a string, a `derivation-input' or a function returning one.
+DIRECTORY may be a string, a `derivation-input' or a function.
+ENVIRONMENT is a list of \"VAR=VALUE\" strings or (VAR . VALUE)
+conses; VALUE may be a string, a `derivation-input' or a function,
+and a nil VALUE unsets VAR.  DIRECTORY defaults to the
+`default-directory' at creation.
+
+Resolved inputs are recorded, so expensive values (such as
+\='(\"nix\" \"build\" \"--no-out-link\" \".#docs\")) pull only when their
+own stamp changes.
+
+SPEC is the tuple of resolved command, directory and environment.
+The process restarts when SPEC changes (compared with `equal').  The
+same restart happens after `derivation-process-restart'.
+
+AUTO-RESTART (default t) restarts an unexpectedly exited child with
+delays from BACKOFF (seconds, default 0.5s, 1s, 2s, 5s, capped).
+Backoff resets after a run longer than the cap.  STOP-SIGNAL (default
+SIGTERM) is followed by SIGKILL after STOP-TIMEOUT seconds (default
+2).  DEBOUNCE delays SPEC-change restarts by that many seconds
+\(default 0, immediate).
+
+The deriver is registered automatically and reconciles on the
+`derivation-run-hooks' schedule.  The child's stdout and stderr go to
+a hidden log buffer with `derivation-mode-line' support; killing that
+buffer stops the process.  `derivation-unregister' accepts the
+returned handle and stops the child.
+
+Returns a `derivation-process' handle.  Use `derivation-process-process',
+`derivation-process-status', `derivation-process-log',
+`derivation-process-live-p' and `derivation-process-exit-status' to
+inspect it, and `derivation-process-start', `derivation-process-stop'
+and `derivation-process-restart' to control it."
+  (unless (and (listp command) command)
+    (error "derivation-make-process: COMMAND must be a non-empty list"))
+  (let* ((name (or name
+                   (let ((program (car command)))
+                     (if (stringp program)
+                         (file-name-nondirectory program)
+                       "derivation-process"))))
+         (log (generate-new-buffer
+               (format " *derivation-process-%s*" name)))
+         (handle (derivation--process-create
+                  :name name
+                  :command command
+                  :directory (cond ((null directory) default-directory)
+                                   ((stringp directory)
+                                    (expand-file-name directory))
+                                   (t directory))
+                  :environment environment
+                  :log log
+                  :desired t
+                  :status :stopped
+                  :restart-count 0
+                  :auto-restart auto-restart
+                  :backoff backoff
+                  :stop-signal stop-signal
+                  :stop-timeout stop-timeout
+                  :debounce debounce))
+         (deriver (lambda () (derivation--process-apply handle)))
+         (kill-hook (lambda () (derivation-unregister handle))))
+    (setf (derivation-process-deriver handle) deriver
+          (derivation-process-kill-hook handle) kill-hook)
+    (with-current-buffer log
+      (erase-buffer)
+      (goto-char (point-max))
+      (add-hook 'kill-buffer-hook kill-hook nil t))
+    (derivation--install-target-hooks
+     log name
+     (lambda (&optional _)
+       (not (derivation-process-live-p handle)))
+     (lambda () (derivation-process-restart handle)))
+    (derivation-register deriver
+                         (lambda () (derivation--process-teardown handle)))
+    (derivation--process-apply handle)
+    handle))
 
 (defun derivation--source-label (source)
   "Return a display name for SOURCE, a buffer or a string label."

@@ -34,6 +34,15 @@
     (kill-buffer (car pair))
     (kill-buffer (cdr pair))))
 
+(defun derivation-test--run-until (predicate &optional timeout)
+  "Run hooks and pump process output until PREDICATE or TIMEOUT."
+  (let ((deadline (time-add (current-time) (or timeout 3))))
+    (while (and (not (funcall predicate))
+                (time-less-p (current-time) deadline))
+      (derivation-run-hooks)
+      (accept-process-output nil 0.05))
+    (funcall predicate)))
+
 
 ;;; Buffer derivation tests
 
@@ -44,9 +53,36 @@
          (src (car bufs))
          (dst (cdr bufs))
          (deriver (derivation-make-deriver "cat" src dst)))
+    (should (derivation-test--run-until
+             (lambda () (equal (with-current-buffer dst (buffer-string))
+                                "hello world"))))
+    (derivation-test--kill-buffers (list bufs))))
+
+(ert-deftest derivation-command-is-async ()
+  "A string command starts in the background; the target updates later."
+  (skip-unless (executable-find "sh"))
+  (let* ((bufs (derivation-test--with-buffers "hello"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-deriver "sh" src dst "-c" "sleep 0.2; cat")))
     (funcall deriver)
-    (with-current-buffer dst
-      (should (equal (buffer-string) "hello world")))
+    ;; The call returned before the command produced output.
+    (should (equal (with-current-buffer dst (buffer-string)) ""))
+    (should (derivation-test--run-until
+             (lambda () (equal (with-current-buffer dst (buffer-string)) "hello"))))
+    (derivation-test--kill-buffers (list bufs))))
+
+(ert-deftest derivation-command-discards-stale-output ()
+  "Output produced for an older source tick is discarded."
+  (skip-unless (executable-find "sh"))
+  (let* ((bufs (derivation-test--with-buffers "old"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-deriver "sh" src dst "-c" "sleep 0.2; cat")))
+    (funcall deriver)
+    (with-current-buffer src (erase-buffer) (insert "new"))
+    (should (derivation-test--run-until
+             (lambda () (equal (with-current-buffer dst (buffer-string)) "new"))))
     (derivation-test--kill-buffers (list bufs))))
 
 (ert-deftest derivation-sink-preserves-point-and-markers ()
@@ -96,9 +132,9 @@
          (src (car bufs))
          (dst (cdr bufs))
          (deriver (derivation-make-deriver "tr" src dst "a-z" "A-Z")))
-    (funcall deriver)
-    (with-current-buffer dst
-      (should (equal (buffer-string) "HELLO WORLD")))
+    (should (derivation-test--run-until
+             (lambda () (equal (with-current-buffer dst (buffer-string))
+                                "HELLO WORLD"))))
     (derivation-test--kill-buffers (list bufs))))
 
 (ert-deftest derivation-memoization ()
@@ -108,9 +144,8 @@
          (src (car bufs))
          (dst (cdr bufs))
          (deriver (derivation-make-deriver "cat" src dst)))
-    (funcall deriver)
-    (with-current-buffer dst
-      (should (equal (buffer-string) "v1")))
+    (should (derivation-test--run-until
+             (lambda () (equal (with-current-buffer dst (buffer-string)) "v1"))))
     (with-current-buffer dst
       (erase-buffer)
       (insert "tampered"))
@@ -120,9 +155,8 @@
     (with-current-buffer src
       (erase-buffer)
       (insert "v2"))
-    (funcall deriver)
-    (with-current-buffer dst
-      (should (equal (buffer-string) "v2")))
+    (should (derivation-test--run-until
+             (lambda () (equal (with-current-buffer dst (buffer-string)) "v2"))))
     (derivation-test--kill-buffers (list bufs))))
 
 (ert-deftest derivation-command-args ()
@@ -132,9 +166,8 @@
          (src (car bufs))
          (dst (cdr bufs))
          (deriver (derivation-make-deriver "tr" src dst "abc" "xyz")))
-    (funcall deriver)
-    (with-current-buffer dst
-      (should (equal (buffer-string) "xyz")))
+    (should (derivation-test--run-until
+             (lambda () (equal (with-current-buffer dst (buffer-string)) "xyz"))))
     (derivation-test--kill-buffers (list bufs))))
 
 (ert-deftest derivation-function ()
@@ -182,8 +215,8 @@
          (src (car bufs))
          (dst (cdr bufs))
          (deriver (derivation-make-deriver "cat" src dst)))
-    (funcall deriver)
-    (should (equal (with-current-buffer dst (buffer-string)) "fixed"))
+    (should (derivation-test--run-until
+             (lambda () (equal (with-current-buffer dst (buffer-string)) "fixed"))))
     (dotimes (_ 5)
       (funcall deriver)
       (should (equal (with-current-buffer dst (buffer-string)) "fixed")))
@@ -223,6 +256,25 @@
       (should-not (funcall buffer-stale-function t))
       ;; Changing the *target* must not count as stale.
       (erase-buffer) (insert "tampered")
+      (should-not (funcall buffer-stale-function t)))
+    (with-current-buffer src (erase-buffer) (insert "world"))
+    (with-current-buffer dst
+      (should (funcall buffer-stale-function t)))
+    (derivation-test--kill-buffers (list bufs))))
+
+(ert-deftest derivation-async-stale-quiet-while-pending ()
+  "Staleness stays quiet while a command for the current tick runs."
+  (skip-unless (executable-find "sh"))
+  (let* ((bufs (derivation-test--with-buffers "hello"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-deriver "sh" src dst "-c" "sleep 0.3; cat")))
+    (funcall deriver)
+    (with-current-buffer dst
+      (should-not (funcall buffer-stale-function t)))
+    (should (derivation-test--run-until
+             (lambda () (equal (with-current-buffer dst (buffer-string)) "hello"))))
+    (with-current-buffer dst
       (should-not (funcall buffer-stale-function t)))
     (with-current-buffer src (erase-buffer) (insert "world"))
     (with-current-buffer dst
@@ -324,13 +376,15 @@
                    "sh" src dst "-c"
                    "if grep -q '^bad' /dev/stdin; then echo errmsg >&2; exit 1; else cat; fi")))
     ;; First run: source is "good", command succeeds, target gets "good".
-    (funcall deriver)
+    (should (derivation-test--run-until
+             (lambda () (equal (with-current-buffer dst (buffer-string)) "good"))))
     (with-current-buffer dst
-      (should (equal (buffer-string) "good"))
       (should-not derivation--error))
     ;; Change source to trigger failure.
     (with-current-buffer src (erase-buffer) (insert "bad content"))
     (funcall deriver)
+    (should (derivation-test--run-until
+             (lambda () (with-current-buffer dst derivation--error))))
     (with-current-buffer dst
       (should (equal (buffer-string) "good"))
       (should derivation--error)
@@ -448,18 +502,20 @@
          (deriver (derivation-make-deriver
                    "sh" src dst "-c"
                    "if grep -q '^bad' /dev/stdin; then echo err >&2; exit 1; else cat; fi")))
-    (funcall deriver)
-    (should (equal (with-current-buffer dst (buffer-string)) "good"))
+    (should (derivation-test--run-until
+             (lambda () (equal (with-current-buffer dst (buffer-string)) "good"))))
     (should-not (with-current-buffer dst derivation--error))
     ;; Make it fail.
     (with-current-buffer src (erase-buffer) (insert "bad content"))
     (funcall deriver)
-    (should (with-current-buffer dst derivation--error))
+    (should (derivation-test--run-until
+             (lambda () (with-current-buffer dst derivation--error))))
     (should (equal (with-current-buffer dst (buffer-string)) "good"))
     ;; Fix it.
     (with-current-buffer src (erase-buffer) (insert "good again"))
-    (funcall deriver)
-    (should (equal (with-current-buffer dst (buffer-string)) "good again"))
+    (should (derivation-test--run-until
+             (lambda () (equal (with-current-buffer dst (buffer-string))
+                                "good again"))))
     (should-not (with-current-buffer dst derivation--error))
     (derivation-test--kill-buffers (list bufs))))
 
@@ -512,9 +568,9 @@
          (src (car bufs))
          (dst (cdr bufs))
          (deriver (derivation-make-deriver "cat" src dst)))
-    (funcall deriver)
-    (with-current-buffer dst
-      (should (equal (buffer-string) "héllo wörld ★")))
+    (should (derivation-test--run-until
+             (lambda () (equal (with-current-buffer dst (buffer-string))
+                                "héllo wörld ★"))))
     (derivation-test--kill-buffers (list bufs))))
 
 ;;; GC survival tests
@@ -526,8 +582,8 @@
          (src (car bufs))
          (dst (cdr bufs))
          (deriver (derivation-make-deriver "cat" src dst)))
-    (funcall deriver)
-    (should (equal (with-current-buffer dst (buffer-string)) "v1"))
+    (should (derivation-test--run-until
+             (lambda () (equal (with-current-buffer dst (buffer-string)) "v1"))))
     ;; Tamper target.
     (with-current-buffer dst (erase-buffer) (insert "tampered"))
     ;; Force several GC cycles.
@@ -547,8 +603,8 @@
          (src (car bufs))
          (dst (cdr bufs))
          (deriver (derivation-make-deriver "cat" src dst)))
-    (funcall deriver)
-    (should (equal (with-current-buffer dst (buffer-string)) "x"))
+    (should (derivation-test--run-until
+             (lambda () (equal (with-current-buffer dst (buffer-string)) "x"))))
     (kill-buffer src)
     ;; Should not signal — buffer-live-p check returns nil.
     (funcall deriver)
@@ -1133,7 +1189,15 @@ the in-place change and triggers recomputation regardless."
   (skip-unless (executable-find "sh"))
   (let ((input (derivation-make-command-input
                 '("sh" "-c" "printf 'hello\\n'"))))
-    (should (equal (derivation-input-value input) "hello"))))
+    (should (equal (derivation-input-wait input) "hello"))))
+
+(ert-deftest derivation-command-input-async ()
+  "The first read signals pending; wait returns the value."
+  (skip-unless (executable-find "sh"))
+  (let ((input (derivation-make-command-input
+                '("sh" "-c" "sleep 0.2; printf hi"))))
+    (should-error (derivation-input-value input) :type 'derivation--pending)
+    (should (equal (derivation-input-wait input 3) "hi"))))
 
 (ert-deftest derivation-command-input-directory ()
   "A command input runs in its DIRECTORY."
@@ -1142,7 +1206,7 @@ the in-place change and triggers recomputation regardless."
          (input (derivation-make-command-input
                  '("sh" "-c" "pwd") :directory dir)))
     (unwind-protect
-        (should (equal (file-truename (derivation-input-value input))
+        (should (equal (file-truename (derivation-input-wait input))
                        (directory-file-name (file-truename dir))))
       (delete-directory dir t))))
 
@@ -1152,14 +1216,14 @@ the in-place change and triggers recomputation regardless."
   (let ((input (derivation-make-command-input
                 '("sh" "-c" "printf %s \"$DERIV_TEST_VAR\"")
                 :environment '("DERIV_TEST_VAR=abc"))))
-    (should (equal (derivation-input-value input) "abc"))))
+    (should (equal (derivation-input-wait input) "abc"))))
 
 (ert-deftest derivation-command-input-failure ()
   "A command input reports stderr and signals `derivation--failed'."
   (skip-unless (executable-find "sh"))
   (let ((input (derivation-make-command-input
                 '("sh" "-c" "echo boom >&2; exit 3"))))
-    (should-error (derivation-input-value input) :type 'derivation--failed)
+    (should-error (derivation-input-wait input) :type 'derivation--failed)
     (should (equal (derivation-input-error input) "boom"))))
 
 (ert-deftest derivation-command-input-reactive-to-stamp ()
@@ -1173,10 +1237,10 @@ the in-place change and triggers recomputation regardless."
         (progn
           (with-temp-file file (insert "one"))
           (set-file-times file (time-add (current-time) 1))
-          (should (equal (derivation-input-value input) "one"))
+          (should (equal (derivation-input-wait input) "one"))
           (with-temp-file file (insert "two"))
           (set-file-times file (time-add (current-time) 20))
-          (should (equal (derivation-input-value input) "two")))
+          (should (equal (derivation-input-wait input) "two")))
       (delete-file file))))
 
 ;;; Process derivation tests
@@ -1303,8 +1367,8 @@ the in-place change and triggers recomputation regardless."
                          :command '("sh" "-c" "exec sleep 30")))
           (derivation-process-stop process)
           (should (derivation-test--wait-for
-                   (lambda () (not (derivation-process-live-p process)))))
-          (should (eq (derivation-process-status process) :stopped))
+                   (lambda () (eq (derivation-process-status process) :stopped))))
+          (should-not (derivation-process-live-p process))
           (derivation-run-hooks)
           (should-not (derivation-process-live-p process))
           (derivation-process-start process)
@@ -1336,7 +1400,8 @@ the in-place change and triggers recomputation regardless."
           (should (eq (derivation-process-status process) :stopping))
           (should (derivation-test--wait-for
                    (lambda () (not (derivation-process-live-p process))) 3))
-          (should (eq (derivation-process-status process) :stopped)))
+          (should (derivation-test--wait-for
+                   (lambda () (eq (derivation-process-status process) :stopped)))))
       (when process
         (derivation-test--process-cleanup process))
       (delete-directory dir t))))

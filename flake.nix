@@ -99,8 +99,10 @@
 
                   Results are memoized per source-buffer tick, variable watcher
                   generation or input stamp, so derivations can run often without
-                  performance impact. On command failure the target keeps its
-                  last good output; errors are shown via a mode-line indicator.
+                  performance impact. External commands run asynchronously and
+                  stale results are discarded. On command failure the target
+                  keeps its last good output; errors are shown via a mode-line
+                  indicator.
                 '';
                 # Read the license from the file header — Elisp packages
                 # conventionally declare it after ";;; Code:".

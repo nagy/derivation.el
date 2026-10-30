@@ -62,7 +62,7 @@
 ;;      '("nix" "build" "--no-out-link" ".#cargo-docs")
 ;;      :directory "/path/to/project"
 ;;      :stamp (derivation-stamp-git "/path/to/project")))
-;;   (derivation-input-value my-docs)        ; => "/nix/store/...-cargo-doc"
+;;   (derivation-input-wait my-docs)         ; => "/nix/store/...-cargo-doc"
 ;;   (derivation-input-invalidate my-docs)   ; force a rebuild next read
 ;;
 ;;   ;; A long-running server, restarted when the docs path changes.
@@ -84,6 +84,12 @@
 ;;
 ;; Because derivations are memoized, calling them repeatedly when the
 ;; source hasn't changed is a no-op — ideal for idle timers.
+;;
+;; External commands in `derivation-make-deriver' and
+;; `derivation-make-command-input' run asynchronously: a call starts the
+;; command and returns, and the target value arrives on a later
+;; `derivation-run-hooks' pass.  Use `derivation-input-wait' to block
+;; for a command input when you need the value immediately.
 ;;
 ;; Error handling:
 ;; When a command fails (non-zero exit), the target buffer keeps its
@@ -114,8 +120,8 @@ COMMAND, DIRECTORY and ENVIRONMENT hold unresolved spec forms
 resolved runtime spec of the current or last process;
 PENDING-SPEC holds a debounced change.  DERIVER is the function
 registered with `derivation-run-hooks'.  AUTO-RESTART, BACKOFF, STOP-SIGNAL, STOP-TIMEOUT, DEBOUNCE and
-ON-CHANGE are policy options.  STATUS is one of `:running',
-`:stopping', `:exited', `:stopped' or `:failed'."
+ON-CHANGE are policy options.  STATUS is one of `:starting',
+`:running', `:stopping', `:exited', `:stopped' or `:failed'."
   name command directory environment
   spec pending-spec next-spec inputs
   log deriver process
@@ -211,6 +217,119 @@ Read-only is bypassed, as the previous sink did."
 ;; stamp, so the next sync retries (used for failed commands).
 (define-error 'derivation--failed "Derivation failed")
 
+;; Signal raised by an asynchronous PULL-FN while its command runs.  The
+;; stamp stays uncommitted, so the next pass retries.
+(define-error 'derivation--pending "Derivation pending")
+
+(defvar derivation--resolving-inputs nil
+  "Inputs seen by the current spec resolution.
+Bound by `derivation--resolve-spec'.")
+
+;;; Asynchronous external commands
+
+(cl-defstruct (derivation--command (:constructor derivation--command-create)
+                                   (:copier nil))
+  "An asynchronous external command.
+PROCESS is the child.  PROGRAM is the user's program name, kept for
+error messages.  STDOUT and STDERR are temp buffers.  STDIN-FILE,
+when non-nil, holds the input content written to disk (a seekable
+stdin).  TICK is the caller's stamp at start.  DONE is non-nil after
+the sentinel runs.  OUTPUT holds stdout text on success, ERROR holds
+stderr text on failure."
+  process stdout stderr stdin-file tick done output error program)
+
+(defun derivation--command-sentinel (command proc _event)
+  "Record PROC's completion in COMMAND."
+  (when (and (eq proc (derivation--command-process command))
+             (buffer-live-p (derivation--command-stdout command))
+             (buffer-live-p (derivation--command-stderr command)))
+    (setf (derivation--command-done command) t)
+    (let ((status (ignore-errors (process-exit-status proc))))
+      (if (equal status 0)
+          (with-current-buffer (derivation--command-stdout command)
+            (setf (derivation--command-output command) (buffer-string)))
+        (let ((text (with-current-buffer (derivation--command-stderr command)
+                      (string-trim (buffer-string)))))
+          (setf (derivation--command-error command)
+                (if (string= text "")
+                    (format "%s exited with status %s"
+                            (or (derivation--command-program command) "command")
+                            status)
+                  text)))))))
+
+(defun derivation--command-start (command args content tick)
+  "Start COMMAND with ARGS.  CONTENT feeds stdin, or nil for /dev/null.
+
+CONTENT goes to a temp file, so stdin stays seekable (some filters
+read it twice).  TICK is recorded for the caller's staleness checks.
+A failure to start the program becomes a completed command with an
+ERROR, so the usual pull path reports it."
+  (let* ((stdin-file (and content (make-temp-file "derivation-stdin-")))
+         (stdout (generate-new-buffer " *derivation-stdout*"))
+         (stderr (generate-new-buffer " *derivation-stderr*"))
+         (object (derivation--command-create
+                  :program command
+                  :stdout stdout :stderr stderr
+                  :stdin-file stdin-file :tick tick)))
+    (condition-case err
+        (progn
+          (when stdin-file
+            (let ((coding-system-for-write 'utf-8-unix))
+              (with-temp-file stdin-file
+                (insert content))))
+          (let* ((script (if stdin-file
+                             "file=$1; shift; exec \"$@\" < \"$file\""
+                           "exec \"$@\" < /dev/null"))
+                 (full (if stdin-file
+                           (append (list "sh" "-c" script "sh" stdin-file command)
+                                   args)
+                         (append (list "sh" "-c" script "sh" command)
+                                 args)))
+                 (proc (make-process
+                        :name "derivation-command"
+                        :command full
+                        :buffer stdout
+                        :stderr stderr
+                        :coding 'utf-8-unix
+                        :connection-type 'pipe
+                        :noquery t
+                        :sentinel
+                        (lambda (p event)
+                          (derivation--command-sentinel object p event)))))
+            (setf (derivation--command-process object) proc)
+            (set-process-coding-system proc 'utf-8-unix 'utf-8-unix)))
+      (error
+       (setf (derivation--command-done object) t
+             (derivation--command-error object) (error-message-string err))))
+    object))
+
+(defun derivation--command-cleanup (command)
+  "Kill COMMAND's stdout and stderr buffers and stdin temp file."
+  (dolist (buf (list (derivation--command-stdout command)
+                     (derivation--command-stderr command)))
+    (when (buffer-live-p buf)
+      (kill-buffer buf)))
+  (let ((file (derivation--command-stdin-file command)))
+    (when (and file (file-exists-p file))
+      (ignore-errors (delete-file file)))))
+
+(defun derivation--command-kill (command)
+  "Kill COMMAND's child and buffers."
+  (let ((proc (derivation--command-process command)))
+    (when (and proc (process-live-p proc))
+      (ignore-errors (delete-process proc))))
+  (derivation--command-cleanup command))
+
+(defun derivation--command-consume (command)
+  "Return COMMAND's output, or signal `derivation--failed'.
+Kill COMMAND's buffers in either case."
+  (unwind-protect
+      (if (derivation--command-error command)
+          (signal 'derivation--failed
+                  (list (derivation--command-error command)))
+        (derivation--command-output command))
+    (derivation--command-cleanup command)))
+
 (cl-defstruct (derivation--memo (:constructor derivation--memo-create))
   "Memoization state for a PULL-FN/PUSH-FN pipeline.
 DIRTYP, SYNC, FORCE and VALUE are closures; see `derivation--memoizer'."
@@ -219,7 +338,7 @@ DIRTYP, SYNC, FORCE and VALUE are closures; see `derivation--memoizer'."
 (defun derivation--memoizer (pull-fn push-fn &optional stamp-fn)
   "Build memoization state for PULL-FN/PUSH-FN versioned by STAMP-FN.
 
-Return a `derivation--memo' with three closures:
+Return a `derivation--memo' with four closures:
 
   DIRTYP  non-nil when the stamp changed since the last commit (always
           non-nil when STAMP-FN is nil: polling mode).
@@ -232,7 +351,10 @@ Return a `derivation--memo' with three closures:
           memo is dirty.  Used by `derivation-input'.
 
 PULL-FN may signal `derivation--failed' to abort without committing the
-stamp, so a later SYNC retries.  The signal propagates to the caller."
+stamp, so a later SYNC retries.  It may also signal
+`derivation--pending' while asynchronous work runs; that also leaves
+the stamp uncommitted, but callers treat it as \"try again later\"
+rather than an error.  The signal propagates to the caller."
   (let ((last-stamp derivation--unset)
         (last-data derivation--unset))
     (cl-labels
@@ -297,7 +419,10 @@ safe default for expensive pulls.  NAME is for display and debugging.
 
 When PULL signals `derivation--failed', the last good value stays
 cached and the signal propagates.  `derivation-input-value' records
-the message in `derivation-input-error'.
+the message in `derivation-input-error'.  A PULL may also signal
+`derivation--pending' while asynchronous work runs; use
+`derivation-input-wait' to block for the value, and let derivations
+propagate the signal.
 
 See `derivation-stamp-or', `derivation-stamp-mtime',
 `derivation-stamp-files', `derivation-stamp-git' and
@@ -326,16 +451,42 @@ See `derivation-stamp-or', `derivation-stamp-mtime',
 
 When PULL fails, the last good value stays cached, the message lands
 in `derivation-input-error', and the `derivation--failed' signal
-propagates."
+propagates.  While asynchronous work runs, this signals
+`derivation--pending'; use `derivation-input-wait' to block for the
+value."
   (unless (derivation-input-p input)
     (error "derivation-input-value: not a derivation-input: %S" input))
   (condition-case err
       (prog1 (funcall (derivation--memo-value (derivation-input-memo input)))
         (setf (derivation-input-error input) nil))
+    (derivation--pending
+     (signal 'derivation--pending nil))
     (derivation--failed
      (setf (derivation-input-error input)
            (or (cadr err) (error-message-string err)))
      (signal (car err) (cdr err)))))
+
+(defun derivation-input-wait (input &optional timeout)
+  "Return INPUT's value, waiting for asynchronous work to finish.
+
+Blocks up to TIMEOUT seconds (default 30) by pumping process output.
+Use this only when you need the value now; derivations and process
+specs should let `derivation--pending' propagate instead."
+  (unless (derivation-input-p input)
+    (error "derivation-input-wait: not a derivation-input: %S" input))
+  (let ((deadline (time-add (current-time) (or timeout 30)))
+        (value nil)
+        (done nil))
+    (while (and (not done) (time-less-p (current-time) deadline))
+      (condition-case nil
+          (setq value (derivation-input-value input)
+                done t)
+        (derivation--pending
+         (accept-process-output nil 0.05))))
+    (unless done
+      (error "derivation-input-wait: timed out waiting for %S"
+             (or (derivation-input-name input) input)))
+    value))
 
 (defun derivation-input-dirty-p (input)
   "Return non-nil when INPUT's stamp changed since the last pull."
@@ -404,21 +555,44 @@ repository without commits stamps HEAD as nil."
             (derivation--git-output directory '("status" "--porcelain" "-uno"))))))
 
 ;;;###autoload
+(defun derivation--command-environment (forms)
+  "Resolve command-input environment FORMS.
+
+Entries are \"VAR=VALUE\" strings or (VAR . VALUE) conses with string
+values.  A nil VALUE becomes (VAR), which unsets the variable."
+  (let ((entries nil))
+    (dolist (entry forms)
+      (cond
+       ((stringp entry)
+        (push entry entries))
+       ((and (consp entry) (stringp (cdr entry)))
+        (push (concat (format "%s" (car entry)) "=" (cdr entry)) entries))
+       ((and (consp entry) (null (cdr entry)))
+        (push (list (format "%s" (car entry))) entries))
+       (t
+        (error "Command input environment values must be strings: %S" entry))))
+    (nreverse entries)))
+
 (cl-defun derivation-make-command-input (command &key directory environment
                                                  stamp transform name)
   "Create a live value from the stdout of a one-shot COMMAND.
 
-COMMAND is a list (PROGRAM ARG...).  It runs synchronously via
-`call-process'.  DIRECTORY is the working directory (default: the
-`default-directory' at creation).  ENVIRONMENT is a list of
-\"VAR=VALUE\" strings prepended to `process-environment', so it
+COMMAND is a list (PROGRAM ARG...).  It runs asynchronously via
+`make-process'.  `derivation-input-value' signals
+`derivation--pending' until the command finishes; use
+`derivation-input-wait' for a blocking read.  DIRECTORY is the
+working directory (default: the `default-directory' at creation).
+ENVIRONMENT is a list of \"VAR=VALUE\" strings or (VAR . VALUE)
+conses with string values, prepended to `process-environment' so it
 overrides inherited variables.  TRANSFORM post-processes stdout
 \(default `string-trim', which drops the trailing newline that most
 commands print).  STAMP, NAME and error handling are as in
 `derivation-make-input'.
 
 On a non-zero exit the input signals `derivation--failed' with the
-captured stderr (or an exit-status message when stderr is empty).
+captured stderr (or an exit-status message when stderr is empty).  A
+command started for an older stamp is discarded when STAMP changed
+meanwhile.
 
 Use this for expensive value producers such as
 \='(\"nix\" \"build\" \"--no-out-link\" \".#docs\").  Pair it with a cheap
@@ -429,48 +603,80 @@ STAMP so the command runs only when its inputs change."
     (unless (stringp arg)
       (error "derivation-make-command-input: COMMAND elements must be strings: %S"
              arg)))
+  (when (and stamp (not (functionp stamp)))
+    (error "derivation-make-command-input: STAMP must be a function or nil"))
+  (when (and transform (not (functionp transform)))
+    (error "derivation-make-command-input: TRANSFORM must be a function or nil"))
   (let* ((directory (file-name-as-directory
                      (expand-file-name (or directory default-directory))))
          (transform (or transform #'string-trim))
-         (environment (append environment process-environment)))
-    (derivation-make-input
-     (lambda ()
-       (let ((default-directory directory)
-             (process-environment environment)
-             (stderr-file (make-temp-file "derivation-stderr-"))
-             (exit nil))
-         (unwind-protect
-             (with-temp-buffer
-               (setq exit (apply #'call-process (car command) nil
-                                 (list (current-buffer) stderr-file)
-                                 nil (cdr command)))
-               (if (zerop exit)
-                   (funcall transform (buffer-string))
-                 (let ((msg (with-temp-buffer
-                              (insert-file-contents stderr-file)
-                              (string-trim (buffer-string)))))
-                   (signal 'derivation--failed
-                           (list (if (string= msg "")
-                                     (format "%s exited with status %d"
-                                             (car command) exit)
-                                   msg))))))
-           (delete-file stderr-file))))
-     stamp name)))
+         (input (derivation--input-create
+                 :name name :stamp stamp :generation 0))
+         (job nil)
+         (kill-job
+          (lambda ()
+            (when job
+              (derivation--command-kill job)
+              (setq job nil))))
+         (effective-stamp
+          (lambda ()
+            (list (derivation-input-generation input)
+                  (and stamp (funcall stamp)))))
+         (start-job
+          (lambda (current)
+            (let ((default-directory directory)
+                  (process-environment
+                   (derivation--process-environment
+                    (derivation--command-environment environment))))
+              (setq job (derivation--command-start
+                         (car command) (cdr command) nil current)))))
+         (pull
+          (lambda ()
+            (let ((current (funcall effective-stamp)))
+              (cond
+               ((and job (derivation--command-done job))
+                (if (equal (derivation--command-tick job) current)
+                    (let ((done job))
+                      (setq job nil)
+                      (funcall transform (derivation--command-consume done)))
+                  (funcall kill-job)
+                  (funcall start-job current)
+                  (signal 'derivation--pending nil)))
+               ((and job (equal (derivation--command-tick job) current))
+                (signal 'derivation--pending nil))
+               (t
+                (funcall kill-job)
+                (funcall start-job current)
+                (signal 'derivation--pending nil)))))))
+    (setf (derivation-input-pull input) pull
+          (derivation-input-memo input)
+          (derivation--memoizer pull #'ignore effective-stamp))
+    input))
 
-(defun derivation--make-buffer-deriver (buf tbuf pull-fn push-fn &optional extra-cleanup)
+(defun derivation--make-buffer-deriver (buf tbuf pull-fn push-fn
+                                          &optional reset-fn pendingp extra-cleanup)
   "Wire a memoized buffer deriver from BUF to TBUF.
-PULL-FN computes the target text (may signal `derivation--failed');
-PUSH-FN renders it.  Memoized on BUF's `buffer-chars-modified-tick'.
+PULL-FN computes the target text (may signal `derivation--failed' or
+`derivation--pending'); PUSH-FN renders it.  Memoized on BUF's
+`buffer-chars-modified-tick'.  RESET-FN, when non-nil, aborts any work
+in flight before a forced rerun.  PENDINGP, when non-nil, reports that
+work for the current tick already runs, so staleness checks stay quiet.
 Installs the auto-revert target hooks, registers the deriver with the
 kill-buffer hooks (plus EXTRA-CLEANUP), and returns the deriver."
   (let* ((memo (derivation--memoizer pull-fn push-fn
                                      (lambda () (buffer-chars-modified-tick buf))))
          (live (lambda () (and (buffer-live-p buf) (buffer-live-p tbuf))))
-         (dirtyp (lambda () (and (funcall live) (funcall (derivation--memo-dirtyp memo)))))
+         (dirtyp (lambda ()
+                   (and (funcall live)
+                        (not (and pendingp (funcall pendingp)))
+                        (funcall (derivation--memo-dirtyp memo)))))
          (guard (lambda (fn)
-                  (condition-case nil (funcall fn) (derivation--failed nil))))
+                  (condition-case nil (funcall fn)
+                    (derivation--failed nil)
+                    (derivation--pending nil))))
          (run (lambda ()
                 (when (funcall live)
+                  (when reset-fn (funcall reset-fn))
                   (funcall guard (derivation--memo-force memo)))))
          (deriver (lambda ()
                     (when (funcall live)
@@ -490,96 +696,128 @@ kill-buffer hooks (plus EXTRA-CLEANUP), and returns the deriver."
 FROMBUF and TOBUF may be buffers or buffer names.
 
 COMMAND may be:
-  - A string: an external program run via `call-process-region'.
-    Extra ARGS are passed as arguments to the command.
-  - A function: called with the source buffer contents as its only
-    argument.  ARGS are ignored.
+  - A string: an external program.  The command runs asynchronously:
+    a call starts it and returns; the target updates on a later
+    `derivation-run-hooks' pass, when the command finished.  Extra
+    ARGS are passed as arguments to the command.
+  - A function: called synchronously with the source buffer contents
+    as its only argument.  ARGS are ignored.
 
 The returned function takes no arguments.  When called, it transforms
 the contents of FROMBUF through COMMAND and replaces the contents of
 TOBUF with the output.  The result is memoized via FROMBUF's
 buffer-chars-modified-tick: if FROMBUF hasn't been modified since the
-last call, TOBUF is left untouched.
+last call, TOBUF is left untouched.  A command started for an older
+tick is discarded when the source changed meanwhile.
 
 When COMMAND fails (non-zero exit) or the function signals an error,
 the target buffer keeps its last good output.  stderr from failed
-commands is captured in a hidden buffer.
+commands is captured in a hidden buffer.  A failed command is retried
+on the next pass.
 
 The target buffer's `buffer-stale-function' and `revert-buffer-function'
 are set buffer-locally so `auto-revert-mode' (or Global Auto-Revert with
-`global-auto-revert-non-file-buffers') can drive re-derivation."
-  (let* ((buf (if (bufferp frombuf) frombuf (get-buffer frombuf)))
-         (tbuf (if (bufferp tobuf) tobuf (get-buffer tobuf)))
-         ;; Created lazily: only a failing string command needs it.
-         (errbuf nil))
+`global-auto-revert-non-file-buffers') can drive re-derivation.
+`revert-buffer' and `derivation-rerun' start a fresh command and return
+before it finishes."
+  (unless (or (stringp command) (functionp command))
+    (error "derivation-make-deriver: COMMAND must be a string or function, got %S"
+           (type-of command)))
+  (let ((buf (if (bufferp frombuf) frombuf (get-buffer frombuf)))
+        (tbuf (if (bufferp tobuf) tobuf (get-buffer tobuf))))
     (unless (buffer-live-p tbuf)
       (error "derivation-make-deriver: target buffer is not live"))
     (unless (buffer-live-p buf)
       (error "derivation-make-deriver: source buffer is not live"))
-    (derivation--make-buffer-deriver
-     buf tbuf
-     ;; PULL: run the command.  On failure, record the error and signal
-     ;; `derivation--failed' so SYNC aborts without committing the tick
-     ;; (the next pass retries).
-     (lambda ()
-       (let* ((content
-               (with-current-buffer buf
-                 (buffer-substring-no-properties (point-min) (point-max))))
-              (result
-               (cl-typecase command
-                 (string
-                  (let ((stderr-file (make-temp-file "deriv-stderr-"))
-                        (exitcode nil))
-                    (unwind-protect
-                        (with-temp-buffer
-                          (setq exitcode
-                                (apply #'call-process-region
-                                       content nil command nil
-                                       (list (current-buffer) stderr-file)
-                                       nil args))
-                          (let ((stdout (buffer-string)))
-                            (if (zerop exitcode)
-                                (cons 'ok stdout)
-                              (let ((errtext
-                                     (with-temp-buffer
-                                       (insert-file-contents stderr-file)
-                                       (buffer-string))))
-                                (cons 'err
-                                      (if (string= errtext "")
-                                          stdout
-                                        errtext))))))
-                      (delete-file stderr-file))))
-                 (function
-                  (condition-case e
-                      (cons 'ok (funcall command content))
-                    (error (cons 'err (error-message-string e)))))
-                 (t
-                  (error "COMMAND must be string or function, got %S"
-                         (type-of command))))))
-         (pcase result
-           (`(ok . ,text) text)
-           (`(err . ,msg)
-            (unless (buffer-live-p errbuf)
-              (setq errbuf (generate-new-buffer
-                            (format " *derivation-err-%s*" (gensym)))))
-            (with-current-buffer errbuf
-              (with-silent-modifications
-                (erase-buffer)
-                (insert msg)))
-            (with-current-buffer tbuf
-              (setq-local derivation--error msg))
-            (signal 'derivation--failed nil)))))
-     ;; PUSH: render the text and clear any prior error.
-     (lambda (text)
-       (with-current-buffer tbuf
-         (derivation--replace-contents text)
-         (setq-local derivation--error nil))
-       (when (buffer-live-p errbuf)
-         (with-current-buffer errbuf
-           (with-silent-modifications (erase-buffer)))))
-     (lambda ()
-       (when (buffer-live-p errbuf)
-         (kill-buffer errbuf))))))
+    (if (stringp command)
+        (let* ((job nil)
+               (kill-job
+                (lambda ()
+                  (when job
+                    (derivation--command-kill job)
+                    (setq job nil))))
+               (start-job
+                (lambda ()
+                  (let ((tick (buffer-chars-modified-tick buf))
+                        (content (with-current-buffer buf
+                                   (buffer-substring-no-properties
+                                    (point-min) (point-max)))))
+                    (setq job (derivation--command-start
+                               command args content tick)))))
+               (pull
+                (lambda ()
+                  (cond
+                   ((and job (derivation--command-done job))
+                    (if (equal (derivation--command-tick job)
+                               (buffer-chars-modified-tick buf))
+                        (let ((done job))
+                          (setq job nil)
+                          (condition-case err
+                              (derivation--command-consume done)
+                            (derivation--failed
+                             (let ((msg (or (cadr err)
+                                            (error-message-string err))))
+                               (with-current-buffer tbuf
+                                 (setq-local derivation--error msg)))
+                             (signal 'derivation--failed (cdr err)))))
+                      (funcall kill-job)
+                      (funcall start-job)
+                      (signal 'derivation--pending nil)))
+                   ((and job
+                         (equal (derivation--command-tick job)
+                                (buffer-chars-modified-tick buf)))
+                    (signal 'derivation--pending nil))
+                   (t
+                    (funcall kill-job)
+                    (funcall start-job)
+                    (signal 'derivation--pending nil)))))
+               (push-fn
+                (lambda (text)
+                  (with-current-buffer tbuf
+                    (derivation--replace-contents text)
+                    (setq-local derivation--error nil)))))
+          (derivation--make-buffer-deriver
+           buf tbuf pull push-fn
+           kill-job
+           (lambda ()
+             (and job
+                  (equal (derivation--command-tick job)
+                         (buffer-chars-modified-tick buf))))
+           kill-job))
+      ;; Function transform: synchronous.
+      (let ((errbuf nil))
+        (derivation--make-buffer-deriver
+         buf tbuf
+         (lambda ()
+           (let ((content (with-current-buffer buf
+                            (buffer-substring-no-properties
+                             (point-min) (point-max)))))
+             (condition-case err
+                 (funcall command content)
+               (error
+                (let ((msg (error-message-string err)))
+                  (unless (buffer-live-p errbuf)
+                    (setq errbuf (generate-new-buffer
+                                  (format " *derivation-err-%s*" (gensym)))))
+                  (with-current-buffer errbuf
+                    (with-silent-modifications
+                      (erase-buffer)
+                      (insert msg)))
+                  (with-current-buffer tbuf
+                    (setq-local derivation--error msg))
+                  (signal 'derivation--failed nil))))))
+         (lambda (text)
+           (with-current-buffer tbuf
+             (derivation--replace-contents text)
+             (setq-local derivation--error nil))
+           (when (buffer-live-p errbuf)
+             (with-current-buffer errbuf
+               (with-silent-modifications (erase-buffer)))))
+         nil
+         nil
+         (lambda ()
+           (when (buffer-live-p errbuf)
+             (kill-buffer errbuf))))))))
 
 ;;; Generic data derivation
 
@@ -649,6 +887,7 @@ Returns the buffer, populated on creation."
                   (when (buffer-live-p buf)
                     (with-current-buffer buf
                       (setq-local derivation--error nil))))
+              (derivation--pending nil)
               (error
                (when (buffer-live-p buf)
                  (with-current-buffer buf
@@ -829,10 +1068,6 @@ This sets TBUF's buffer-local `buffer-stale-function' and
                 (lambda (&rest _) (funcall run) t))))
 
 ;;; Process derivation
-
-(defvar derivation--resolving-inputs nil
-  "Inputs seen by the current spec resolution.
-Bound by `derivation--resolve-spec'.")
 
 (defun derivation-process-live-p (process)
   "Return non-nil when PROCESS has a live child."
@@ -1212,6 +1447,9 @@ FORCE skips the debounce delay; the debounce timer uses it."
              (t
               (derivation--process-change process spec)
               (setq changed t))))
+        (derivation--pending
+         (unless (derivation-process-live-p process)
+           (setf (derivation-process-status process) :starting)))
         (derivation--failed
          (unless (derivation-process-process process)
            (setf (derivation-process-status process) :failed))
@@ -1249,18 +1487,22 @@ be gone by then."
   (derivation--process-cancel-timer process)
   (derivation--process-cancel-restart-timer process)
   (setf (derivation-process-desired process) t)
-  (pcase-let ((`(,spec . ,inputs) (derivation--resolve-spec process)))
-    (setf (derivation-process-inputs process) inputs)
-    (cond
-     ((not (derivation-process-live-p process))
-      (setf (derivation-process-spec process) spec)
-      (derivation--process-start process spec))
-     ((derivation-process-stoppingp process)
-      ;; The child is already on its way out: start SPEC after it.
-      (setf (derivation-process-next-spec process) spec))
-     ((not (equal spec (derivation-process-spec process)))
-      (setf (derivation-process-next-spec process) spec)
-      (derivation--process-request-stop process))))
+  (condition-case nil
+      (pcase-let ((`(,spec . ,inputs) (derivation--resolve-spec process)))
+        (setf (derivation-process-inputs process) inputs)
+        (cond
+         ((not (derivation-process-live-p process))
+          (setf (derivation-process-spec process) spec)
+          (derivation--process-start process spec))
+         ((derivation-process-stoppingp process)
+          ;; The child is already on its way out: start SPEC after it.
+          (setf (derivation-process-next-spec process) spec))
+         ((not (equal spec (derivation-process-spec process)))
+          (setf (derivation-process-next-spec process) spec)
+          (derivation--process-request-stop process))))
+    (derivation--pending
+     (unless (derivation-process-live-p process)
+       (setf (derivation-process-status process) :starting))))
   process)
 
 (defun derivation-process-stop (process)
@@ -1284,14 +1526,18 @@ sentinel after the old child exits."
   (setf (derivation-process-desired process) t)
   (derivation--process-cancel-timer process)
   (derivation--process-cancel-restart-timer process)
-  (pcase-let ((`(,spec . ,inputs) (derivation--resolve-spec process)))
-    (setf (derivation-process-inputs process) inputs)
-    (if (derivation-process-live-p process)
-        (progn
-          (setf (derivation-process-next-spec process) spec)
-          (derivation--process-request-stop process))
-      (setf (derivation-process-spec process) spec)
-      (derivation--process-start process spec)))
+  (condition-case nil
+      (pcase-let ((`(,spec . ,inputs) (derivation--resolve-spec process)))
+        (setf (derivation-process-inputs process) inputs)
+        (if (derivation-process-live-p process)
+            (progn
+              (setf (derivation-process-next-spec process) spec)
+              (derivation--process-request-stop process))
+          (setf (derivation-process-spec process) spec)
+          (derivation--process-start process spec)))
+    (derivation--pending
+     (unless (derivation-process-live-p process)
+       (setf (derivation-process-status process) :starting))))
   process)
 
 ;;;###autoload
@@ -1441,7 +1687,10 @@ Click to jump to the source buffer.")
   "Re-run the derivation chain that produced the current buffer.
 Walks `derivation--source' transitively: if this target is itself the
 source of another derivation, that one is re-run too, so a pipeline
-converges in a single call.  Re-runs bypass memoization."
+converges in a single call.  Re-runs bypass memoization.
+
+Asynchronous command derivers start a fresh command and return before
+it finishes; their targets update on a later pass."
   (interactive)
   (unless derivation--source
     (user-error "Buffer is not a derivation target"))

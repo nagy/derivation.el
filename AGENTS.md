@@ -17,9 +17,12 @@
 - `derivation-make-var-deriver` takes `(func fromvar tovar)`. `func` is called with the value of `fromvar`. The result is assigned to `tovar` via `set`. Auto-registered via `derivation-register` (no buffer lifecycle). Thin wrapper over `derivation--memoizer`.
 - `derivation-make-section-filter` takes `(predicate frombuf tobuf)`. `predicate` is called with each child of `magit-root-section` in `frombuf`; matching section text is copied to `tobuf`. Uses `slot-value` + `with-no-warnings` to avoid a hard magit-section compile-time dependency. Thin wrapper over `derivation--make-buffer-deriver`.
 - `derivation-make` takes `(pull-fn push-fn &optional stamp-fn)` — the generic data-deriver primitive. `pull-fn` returns the derived data (a pure scan of global state); `push-fn` renders it and is responsible for selecting its target buffer. Memoized on `equal` of the data (`copy-tree`ed); with `stamp-fn` the pull is skipped while the stamp is unchanged. Does NOT self-register — callers pass the result to `derivation-register`.
+- `derivation-make-input` takes `(pull &optional stamp name)` and returns a `derivation-input`: a memoized live value. `derivation-input-value` pulls only when the stamp changed or after `derivation-input-invalidate`; with no stamp the input pulls once, then only on invalidation. A stamp is a zero-arg function returning an `equal`-comparable value. Stamps compose via `derivation-stamp-or`; helpers: `derivation-stamp-always`, `derivation-stamp-mtime`, `derivation-stamp-files`, `derivation-stamp-git` (HEAD + tracked dirt, untracked files ignored like Nix flakes). Errors signal `derivation--failed`, keep the last good value, and land in `derivation-input-error`.
+- `derivation-make-command-input` takes `(command &key directory environment stamp transform name)`: one-shot `call-process`, stdout captured, default `transform` is `string-trim`, nonzero exit signals `derivation--failed` with stderr. Synchronous. Use it for one-shot value producers such as `nix build --no-out-link`.
+- `derivation--memoizer` also exposes a VALUE closure (dirty check + sync + last data), so `derivation-input` reuses the primitive instead of a second memo implementation. An input folds a generation counter plus its stamp into the memo stamp, so manual invalidation works even with a stamp.
 - `derivation-make-tabulated` takes `(entries-fn format &key name sort-key)` — a live `tabulated-list-mode` buffer. `entries-fn` returns `tabulated-list-entries` rows; the deriver polls on the runner schedule and re-renders only on change. Non-idempotent: each call makes a fresh buffer (`generate-new-buffer-name`) and registers a fresh deriver that unregisters when the buffer is killed; renders once at creation; returns the buffer. Errors keep the last good table and set `derivation--error`.
 - `derivation--source` is `(SOURCE . RUN-FN)`: SOURCE is a buffer or a string label (data derivations have no source buffer); RUN-FN recomputes the target bypassing memoization (used by `derivation-rerun` and `revert-buffer`). Both `derivation-mode-line` and `derivation-jump-to-source` handle either SOURCE form.
-- `derivation--memoizer` is the single memoization primitive (returns a `derivation--memo` struct of DIRTYP/SYNC/FORCE closures). `derivation-make` uses SYNC; the three constructors do too. `derivation--make-buffer-deriver` builds a tick-stamped buffer deriver on top and wires `derivation--install-target-hooks` + kill hooks. A PULL-FN may signal `derivation--failed` to abort without committing the stamp (retry on the next pass); FORCE bypasses memoization for rerun/revert.
+- `derivation--memoizer` is the single memoization primitive (returns a `derivation--memo` struct of DIRTYP/SYNC/FORCE/VALUE closures). `derivation-make` uses SYNC; the three constructors do too; `derivation-input` uses VALUE. `derivation--make-buffer-deriver` builds a tick-stamped buffer deriver on top and wires `derivation--install-target-hooks` + kill hooks. A PULL-FN may signal `derivation--failed` to abort without committing the stamp (retry on the next pass); FORCE bypasses memoization for rerun/revert.
 - `derivation-rerun` collects the upstream chain by `push`-ing while walking current → upstream, so the list is already upstream → downstream; it iterates it directly (no `reverse`). Running downstream-first would let a target transform read a stale intermediate. `derivation-run-hooks` converges via its fixpoint loop instead.
 - Buffer derivers (`derivation-make-deriver`, `derivation-make-section-filter`) install `buffer-stale-function` and `revert-buffer-function` buffer-locally in the target via `derivation--install-target-hooks`. This lets the built-in `auto-revert-mode` (or `global-auto-revert-mode` + `global-auto-revert-non-file-buffers`) drive re-derivation instead of the idle timer. Staleness is the cheap tick check; `revert-buffer` runs the inner transform directly (bypassing memoization, like `derivation-rerun`).
 - `derivation--walk-tree` traverses the section tree, reading each node's EIEIO `children` slot directly (the only concrete tree is magit's `magit-section`). No `cl-defgeneric`; add one only if a second concrete tree type appears.
@@ -38,7 +41,7 @@
 
 ## Known limitations (current session)
 
-- Buffer source derivers poll via idle timer, or — opt-in — via `auto-revert-mode` using the installed `buffer-stale-function`. Long-running commands block Emacs (sync `call-process-region`).
+- Buffer source derivers poll via idle timer, or — opt-in — via `auto-revert-mode` using the installed `buffer-stale-function`. Long-running commands block Emacs (sync `call-process-region`). `derivation-make-command-input` runs synchronously too, so an expensive command blocks Emacs during the pull.
 - In-place mutations on vectors and hash tables are not caught by `equal` (vectors are handled by `copy-tree cur-val t`; hash tables are not).
 - `derivation--storage` is a double-dash private var; the public API is `derivation-register`/`derivation-unregister`.  Rename the var to `derivation-storage` eventually.
 
@@ -60,6 +63,10 @@ The rename from the old `make-*` names landed in the pre-0.1 history
 Status: DONE. `derivation--memoizer` is the single primitive (a `derivation--memo` struct of DIRTYP/SYNC/FORCE closures); `derivation-make` and all three original constructors wrap it. `derivation--make-buffer-deriver` adds the tick stamp + target hooks + kill hooks for the two buffer constructors. See `derivation--memoizer`.
 
 Buffer source stamps on `buffer-chars-modified-tick`; the variable deriver stamps on nothing (polls) and memoizes on `equal` of the value; the section filter stamps on the source tick. A PULL-FN may signal `derivation--failed` to abort without committing the stamp; FORCE bypasses memoization for rerun/revert.
+
+### First-class inputs (started)
+
+`derivation-input` landed: memoized live values with cheap `equal` stamps and manual invalidation, plus the stamp constructors. The buffer and variable constructors still carry ad-hoc stamps; the process sink is the first intended consumer.
 
 ### Push, not poll
 
@@ -87,8 +94,12 @@ Numbered work items for this project.  **Remove items entirely once finished** (
 
 1. **Async processes.** `make-process` + sentinel with a generation counter to discard stale results. `call-process-region` freezes the UI on every keystroke-then-idle for slow commands.
 
+2. **Process sink.** `derivation-make-process` wrapping a long-running child in a spec built from `derivation-input`s: resolve command, directory and environment, reconcile on `equal` spec change (stop, wait for port release, start), sentinel-driven restart policy with backoff, SIGTERM then SIGKILL, log buffer with `derivation-mode-line`. Inputs and stamps landed first; this is the next layer.
+
+3. **Wire inputs into existing derivers.** `derivation--make-buffer-deriver` and `derivation-make-var-deriver` still build stamps by hand; a buffer input and a variable input would unify them under `derivation-input` (buffer tick, watcher generation).
+
 ### Cleanup
 
-2. **Test `derivation-mode-line-form-evaluates` tests implementation, not behavior.** It `eval`s `(cadr derivation-mode-line)` directly. A rendering-based test is impossible in the batch suite: `format-mode-line` is a deliberate no-op when `noninteractive` (see `Fformat_mode_line` in xdisp.c), so the rendered string can't be checked under `emacs --batch`. Either keep the eval-based test or move the suite to a display-backed runner.
+4. **Test `derivation-mode-line-form-evaluates` tests implementation, not behavior.** It `eval`s `(cadr derivation-mode-line)` directly. A rendering-based test is impossible in the batch suite: `format-mode-line` is a deliberate no-op when `noninteractive` (see `Fformat_mode_line` in xdisp.c), so the rendered string can't be checked under `emacs --batch`. Either keep the eval-based test or move the suite to a display-backed runner.
 
-3. **Minor: stderr capture.** `with-temp-buffer` + `insert-file-contents` for stderr could be a single `insert-file-contents` into a reused buffer.
+5. **Minor: stderr capture.** `with-temp-buffer` + `insert-file-contents` for stderr could be a single `insert-file-contents` into a reused buffer.

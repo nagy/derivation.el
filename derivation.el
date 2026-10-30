@@ -56,6 +56,15 @@
 ;;   ;; Derive variable `baz' from `foo' via `length'.
 ;;   (derivation-register (derivation-make-var-deriver #'length 'foo 'baz))
 ;;
+;;   ;; A live value computed by a one-shot command.
+;;   (defvar my-docs
+;;     (derivation-make-command-input
+;;      '("nix" "build" "--no-out-link" ".#cargo-docs")
+;;      :directory "/path/to/project"
+;;      :stamp (derivation-stamp-git "/path/to/project")))
+;;   (derivation-input-value my-docs)        ; => "/nix/store/...-cargo-doc"
+;;   (derivation-input-invalidate my-docs)   ; force a rebuild next read
+;;
 ;;   ;; Run derivations on idle.
 ;;   (run-with-idle-timer 0.1 t #'derivation-run-hooks)
 ;;
@@ -176,8 +185,8 @@ Read-only is bypassed, as the previous sink did."
 
 (cl-defstruct (derivation--memo (:constructor derivation--memo-create))
   "Memoization state for a PULL-FN/PUSH-FN pipeline.
-DIRTYP, SYNC and FORCE are closures; see `derivation--memoizer'."
-  dirtyp sync force)
+DIRTYP, SYNC, FORCE and VALUE are closures; see `derivation--memoizer'."
+  dirtyp sync force value)
 
 (defun derivation--memoizer (pull-fn push-fn &optional stamp-fn)
   "Build memoization state for PULL-FN/PUSH-FN versioned by STAMP-FN.
@@ -191,39 +200,234 @@ Return a `derivation--memo' with three closures:
   FORCE   pull and push unconditionally, committing the stamp and the
           data (bypasses memoization; used by rerun/revert).
 
+  VALUE   return the last pulled data, running SYNC first when the
+          memo is dirty.  Used by `derivation-input'.
+
 PULL-FN may signal `derivation--failed' to abort without committing the
 stamp, so a later SYNC retries.  The signal propagates to the caller."
   (let ((last-stamp derivation--unset)
         (last-data derivation--unset))
-    (cl-flet ((commit (data stamp)
-                (setq last-stamp stamp)
-                (unless (equal data last-data)
-                  (setq last-data (copy-tree data t))
-                  (funcall push-fn data)
-                  t)))
+    (cl-labels
+        ((commit (data stamp)
+           (setq last-stamp stamp)
+           (unless (equal data last-data)
+             (setq last-data (copy-tree data t))
+             (funcall push-fn data)
+             t))
+         (dirtyp ()
+           (or (null stamp-fn)
+               (eq last-stamp derivation--unset)
+               (not (equal (funcall stamp-fn) last-stamp))))
+         (sync ()
+           (let* ((poll (null stamp-fn))
+                  (stamp (unless poll (funcall stamp-fn))))
+             (when (or poll
+                       (eq last-stamp derivation--unset)
+                       (not (equal stamp last-stamp)))
+               (commit (funcall pull-fn) stamp))))
+         (force ()
+           ;; Bypass memoization: re-render even when the data is
+           ;; unchanged (rerun/revert must repair a tampered target).
+           (let ((data (funcall pull-fn)))
+             (setq last-stamp (and stamp-fn (funcall stamp-fn))
+                   last-data (copy-tree data t))
+             (funcall push-fn data)
+             t))
+         (value ()
+           ;; SYNC already compares the stamp, so no DIRTYP pre-check:
+           ;; that would call an expensive stamp twice per read.
+           (sync)
+           (unless (eq last-data derivation--unset) last-data)))
       (derivation--memo-create
-       :dirtyp
-       (lambda ()
-         (or (null stamp-fn)
-             (eq last-stamp derivation--unset)
-             (not (equal (funcall stamp-fn) last-stamp))))
-       :sync
-       (lambda ()
-         (let* ((poll (null stamp-fn))
-                (stamp (unless poll (funcall stamp-fn))))
-           (when (or poll
-                     (eq last-stamp derivation--unset)
-                     (not (equal stamp last-stamp)))
-             (commit (funcall pull-fn) stamp))))
-       :force
-       (lambda ()
-         ;; Bypass memoization: re-render even when the data is
-         ;; unchanged (rerun/revert must repair a tampered target).
-         (let ((data (funcall pull-fn)))
-           (setq last-stamp (and stamp-fn (funcall stamp-fn))
-                 last-data (copy-tree data t))
-           (funcall push-fn data)
-           t))))))
+       :dirtyp #'dirtyp :sync #'sync :force #'force :value #'value))))
+
+;;; Live inputs and staleness stamps
+
+;; A stamp is a zero-argument function returning an `equal'-comparable
+;; value.  It answers "did anything change?" without doing the work
+;; that an input's PULL-FN does.  Compose stamps with
+;; `derivation-stamp-or'.
+
+(cl-defstruct (derivation-input (:constructor derivation--input-create)
+                                 (:copier nil))
+  "A memoized live value with an explicit staleness STAMP.
+PULL is called only when STAMP changed or after
+`derivation-input-invalidate'.  MEMO holds the shared memoization
+state (see `derivation--memoizer').  GENERATION counts manual
+invalidations.  ERROR holds the last failure message."
+  name pull stamp generation memo error)
+
+;;;###autoload
+(defun derivation-make-input (pull &optional stamp name)
+  "Create a memoized live value computed by PULL.
+
+PULL is called with no arguments and returns the value.  STAMP is a
+zero-argument function returning an `equal'-comparable value: the
+input pulls again only when STAMP changed.  With STAMP nil the input
+pulls once and then only after `derivation-input-invalidate' — the
+safe default for expensive pulls.  NAME is for display and debugging.
+
+When PULL signals `derivation--failed', the last good value stays
+cached and the signal propagates.  `derivation-input-value' records
+the message in `derivation-input-error'.
+
+See `derivation-stamp-or', `derivation-stamp-mtime',
+`derivation-stamp-files', `derivation-stamp-git' and
+`derivation-stamp-always' for stamp constructors."
+  (unless (functionp pull)
+    (error "derivation-make-input: PULL must be a function, got %S"
+           (type-of pull)))
+  (when (and stamp (not (functionp stamp)))
+    (error "derivation-make-input: STAMP must be a function or nil, got %S"
+           (type-of stamp)))
+  (let ((input (derivation--input-create
+                :name name :pull pull :stamp stamp :generation 0)))
+    (setf (derivation-input-memo input)
+          (derivation--memoizer
+           pull #'ignore
+           ;; The generation counter makes every input manually
+           ;; invalidatable even when it carries a stamp.
+           (lambda ()
+             (list (derivation-input-generation input)
+                   (and (derivation-input-stamp input)
+                        (funcall (derivation-input-stamp input)))))))
+    input))
+
+(defun derivation-input-value (input)
+  "Return the current value of INPUT, pulling again when stale.
+
+When PULL fails, the last good value stays cached, the message lands
+in `derivation-input-error', and the `derivation--failed' signal
+propagates."
+  (unless (derivation-input-p input)
+    (error "derivation-input-value: not a derivation-input: %S" input))
+  (condition-case err
+      (prog1 (funcall (derivation--memo-value (derivation-input-memo input)))
+        (setf (derivation-input-error input) nil))
+    (derivation--failed
+     (setf (derivation-input-error input)
+           (or (cadr err) (error-message-string err)))
+     (signal (car err) (cdr err)))))
+
+(defun derivation-input-dirty-p (input)
+  "Return non-nil when INPUT's stamp changed since the last pull."
+  (unless (derivation-input-p input)
+    (error "derivation-input-dirty-p: not a derivation-input: %S" input))
+  (funcall (derivation--memo-dirtyp (derivation-input-memo input))))
+
+(defun derivation-input-invalidate (input)
+  "Mark INPUT stale.  The next `derivation-input-value' pulls again.
+
+Returns INPUT, so calls chain."
+  (unless (derivation-input-p input)
+    (error "derivation-input-invalidate: not a derivation-input: %S" input))
+  (cl-incf (derivation-input-generation input))
+  input)
+
+(defun derivation-stamp-always ()
+  "Return a stamp that changes on every check (polling mode)."
+  (let ((counter 0))
+    (lambda () (cl-incf counter))))
+
+(defun derivation-stamp-or (&rest stamps)
+  "Return a stamp that changes when any of STAMPS changes.
+
+STAMPS are zero-argument functions.  The result returns a list of
+their values, so it is `equal'-comparable."
+  (dolist (stamp stamps)
+    (unless (functionp stamp)
+      (error "derivation-stamp-or: not a stamp: %S" stamp)))
+  (lambda () (mapcar #'funcall stamps)))
+
+(defun derivation-stamp-mtime (file)
+  "Return a stamp over FILE's modification time.
+
+A missing FILE stamps as nil, so creating it counts as a change."
+  (let ((file (expand-file-name file)))
+    (lambda ()
+      (let ((attrs (file-attributes file)))
+        (and attrs (file-attribute-modification-time attrs))))))
+
+(defun derivation-stamp-files (files)
+  "Return a stamp over the modification times of FILES."
+  (apply #'derivation-stamp-or (mapcar #'derivation-stamp-mtime files)))
+
+(defun derivation--git-output (directory args)
+  "Run git with ARGS in DIRECTORY.  Return output, or nil on failure."
+  (with-temp-buffer
+    (let* ((default-directory (file-name-as-directory
+                               (expand-file-name directory)))
+           (code (apply #'call-process "git" nil t nil args)))
+      (when (zerop code)
+        (buffer-string)))))
+
+(defun derivation-stamp-git (directory)
+  "Return a stamp over DIRECTORY's git HEAD and tracked modifications.
+
+Untracked files are ignored, matching what Nix flakes see.  A
+repository without commits stamps HEAD as nil."
+  (unless (executable-find "git")
+    (error "derivation-stamp-git: git executable not found"))
+  (unless (file-directory-p directory)
+    (error "derivation-stamp-git: not a directory: %s" directory))
+  (let ((directory (file-name-as-directory (expand-file-name directory))))
+    (lambda ()
+      (list (derivation--git-output directory '("rev-parse" "--verify" "HEAD"))
+            (derivation--git-output directory '("status" "--porcelain" "-uno"))))))
+
+;;;###autoload
+(cl-defun derivation-make-command-input (command &key directory environment
+                                                 stamp transform name)
+  "Create a live value from the stdout of a one-shot COMMAND.
+
+COMMAND is a list (PROGRAM ARG...).  It runs synchronously via
+`call-process'.  DIRECTORY is the working directory (default: the
+`default-directory' at creation).  ENVIRONMENT is a list of
+\"VAR=VALUE\" strings prepended to `process-environment', so it
+overrides inherited variables.  TRANSFORM post-processes stdout
+\(default `string-trim', which drops the trailing newline that most
+commands print).  STAMP, NAME and error handling are as in
+`derivation-make-input'.
+
+On a non-zero exit the input signals `derivation--failed' with the
+captured stderr (or an exit-status message when stderr is empty).
+
+Use this for expensive value producers such as
+\='(\"nix\" \"build\" \"--no-out-link\" \".#docs\").  Pair it with a cheap
+STAMP so the command runs only when its inputs change."
+  (unless (and (listp command) (stringp (car command)))
+    (error "derivation-make-command-input: COMMAND must be (PROGRAM ARG...)"))
+  (dolist (arg command)
+    (unless (stringp arg)
+      (error "derivation-make-command-input: COMMAND elements must be strings: %S"
+             arg)))
+  (let* ((directory (file-name-as-directory
+                     (expand-file-name (or directory default-directory))))
+         (transform (or transform #'string-trim))
+         (environment (append environment process-environment)))
+    (derivation-make-input
+     (lambda ()
+       (let ((default-directory directory)
+             (process-environment environment)
+             (stderr-file (make-temp-file "derivation-stderr-"))
+             (exit nil))
+         (unwind-protect
+             (with-temp-buffer
+               (setq exit (apply #'call-process (car command) nil
+                                 (list (current-buffer) stderr-file)
+                                 nil (cdr command)))
+               (if (zerop exit)
+                   (funcall transform (buffer-string))
+                 (let ((msg (with-temp-buffer
+                              (insert-file-contents stderr-file)
+                              (string-trim (buffer-string)))))
+                   (signal 'derivation--failed
+                           (list (if (string= msg "")
+                                     (format "%s exited with status %d"
+                                             (car command) exit)
+                                   msg))))))
+           (delete-file stderr-file))))
+     stamp name)))
 
 (defun derivation--make-buffer-deriver (buf tbuf pull-fn push-fn &optional extra-cleanup)
   "Wire a memoized buffer deriver from BUF to TBUF.

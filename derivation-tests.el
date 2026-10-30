@@ -1023,5 +1023,161 @@ the in-place change and triggers recomputation regardless."
     (funcall deriver)
     (should (equal (with-current-buffer dst (buffer-string)) "HELLO"))
     (derivation-test--kill-buffers (list bufs))))
+;;; Input and stamp tests
+
+(defun derivation-test--git (dir &rest args)
+  "Run git with ARGS in DIR, return exit status."
+  (with-temp-buffer
+    (let ((default-directory (file-name-as-directory dir)))
+      (apply #'call-process "git" nil t nil args))))
+
+(ert-deftest derivation-input-pulls-once-until-invalidated ()
+  "Without a stamp, an input pulls once and then on invalidation."
+  (let ((pulls 0) (value 1))
+    (let ((input (derivation-make-input (lambda () (cl-incf pulls) value))))
+      (should (= (derivation-input-value input) 1))
+      (should (= (derivation-input-value input) 1))
+      (should (= pulls 1))
+      (setq value 2)
+      (should (= (derivation-input-value input) 1))
+      (derivation-input-invalidate input)
+      (should (= (derivation-input-value input) 2))
+      (should (= pulls 2)))))
+
+(ert-deftest derivation-input-stamp-skips-pull ()
+  "An unchanged stamp avoids the pull; a changed stamp forces it."
+  (let ((stamp 1) (pulls 0))
+    (let ((input (derivation-make-input
+                  (lambda () (cl-incf pulls) stamp)
+                  (lambda () stamp))))
+      (should (= (derivation-input-value input) 1))
+      (should (= (derivation-input-value input) 1))
+      (should (= pulls 1))
+      (should-not (derivation-input-dirty-p input))
+      (setq stamp 2)
+      (should (derivation-input-dirty-p input))
+      (should (= (derivation-input-value input) 2))
+      (should (= pulls 2)))))
+
+(ert-deftest derivation-input-failure-keeps-last-good ()
+  "A failed pull keeps the cached value and retries on the next read."
+  (let ((fail nil))
+    (let ((input (derivation-make-input
+                  (lambda ()
+                    (if fail
+                        (signal 'derivation--failed (list "boom"))
+                      42)))))
+      (should (= (derivation-input-value input) 42))
+      (setq fail t)
+      (derivation-input-invalidate input)
+      (should-error (derivation-input-value input) :type 'derivation--failed)
+      (should (equal (derivation-input-error input) "boom"))
+      (setq fail nil)
+      (should (= (derivation-input-value input) 42))
+      (should-not (derivation-input-error input)))))
+
+(ert-deftest derivation-stamp-always-changes ()
+  "The polling stamp differs on every call."
+  (let ((stamp (derivation-stamp-always)))
+    (should-not (equal (funcall stamp) (funcall stamp)))))
+
+(ert-deftest derivation-stamp-or-combines ()
+  "The combined stamp changes when any component changes."
+  (let* ((a 1) (b 1)
+         (stamp (derivation-stamp-or (lambda () a) (lambda () b)))
+         (before (funcall stamp)))
+    (should (equal before (funcall stamp)))
+    (setq b 2)
+    (should-not (equal before (funcall stamp)))))
+
+(ert-deftest derivation-stamp-mtime-tracks-file ()
+  "The mtime stamp changes after a file update."
+  (let* ((file (make-temp-file "deriv-stamp-"))
+         (stamp (derivation-stamp-mtime file)))
+    (unwind-protect
+        (let ((before (funcall stamp)))
+          (should (equal before (funcall stamp)))
+          (set-file-times file (time-add (current-time) 10))
+          (should-not (equal before (funcall stamp))))
+      (delete-file file))))
+
+(ert-deftest derivation-stamp-mtime-missing-file ()
+  "A missing file stamps as nil."
+  (should-not (funcall (derivation-stamp-mtime
+                        (expand-file-name "deriv-does-not-exist"
+                                          temporary-file-directory)))))
+
+(ert-deftest derivation-stamp-git-tracks-head-and-worktree ()
+  "The git stamp changes on commit and on tracked modifications."
+  (skip-unless (executable-find "git"))
+  (let ((dir (make-temp-file "deriv-git-" t)))
+    (unwind-protect
+        (progn
+          (should (zerop (derivation-test--git dir "init" "-q")))
+          (should (zerop (derivation-test--git dir "config" "user.email"
+                                               "test@example.com")))
+          (should (zerop (derivation-test--git dir "config" "user.name"
+                                               "Test")))
+          (with-temp-file (expand-file-name "a.txt" dir) (insert "one"))
+          (should (zerop (derivation-test--git dir "add" "a.txt")))
+          (should (zerop (derivation-test--git dir "commit" "-q" "-m" "one")))
+          (let* ((stamp (derivation-stamp-git dir))
+                 (before (funcall stamp)))
+            (should (equal before (funcall stamp)))
+            (with-temp-file (expand-file-name "a.txt" dir) (insert "two"))
+            (should-not (equal before (funcall stamp)))))
+      (delete-directory dir t))))
+
+(ert-deftest derivation-command-input ()
+  "A command input captures and trims stdout."
+  (skip-unless (executable-find "sh"))
+  (let ((input (derivation-make-command-input
+                '("sh" "-c" "printf 'hello\\n'"))))
+    (should (equal (derivation-input-value input) "hello"))))
+
+(ert-deftest derivation-command-input-directory ()
+  "A command input runs in its DIRECTORY."
+  (skip-unless (executable-find "sh"))
+  (let* ((dir (file-name-as-directory (make-temp-file "deriv-dir-" t)))
+         (input (derivation-make-command-input
+                 '("sh" "-c" "pwd") :directory dir)))
+    (unwind-protect
+        (should (equal (file-truename (derivation-input-value input))
+                       (directory-file-name (file-truename dir))))
+      (delete-directory dir t))))
+
+(ert-deftest derivation-command-input-environment ()
+  "A command input sees the appended environment."
+  (skip-unless (executable-find "sh"))
+  (let ((input (derivation-make-command-input
+                '("sh" "-c" "printf %s \"$DERIV_TEST_VAR\"")
+                :environment '("DERIV_TEST_VAR=abc"))))
+    (should (equal (derivation-input-value input) "abc"))))
+
+(ert-deftest derivation-command-input-failure ()
+  "A command input reports stderr and signals `derivation--failed'."
+  (skip-unless (executable-find "sh"))
+  (let ((input (derivation-make-command-input
+                '("sh" "-c" "echo boom >&2; exit 3"))))
+    (should-error (derivation-input-value input) :type 'derivation--failed)
+    (should (equal (derivation-input-error input) "boom"))))
+
+(ert-deftest derivation-command-input-reactive-to-stamp ()
+  "An mtime stamp reruns the command only after the file changes."
+  (skip-unless (executable-find "sh"))
+  (let* ((file (make-temp-file "deriv-in-"))
+         (input (derivation-make-command-input
+                 (list "sh" "-c" "cat \"$1\"" "sh" file)
+                 :stamp (derivation-stamp-mtime file))))
+    (unwind-protect
+        (progn
+          (with-temp-file file (insert "one"))
+          (set-file-times file (time-add (current-time) 1))
+          (should (equal (derivation-input-value input) "one"))
+          (with-temp-file file (insert "two"))
+          (set-file-times file (time-add (current-time) 20))
+          (should (equal (derivation-input-value input) "two")))
+      (delete-file file))))
+
 (provide 'derivation-tests)
 ;;; derivation-tests.el ends here

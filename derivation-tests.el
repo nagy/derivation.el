@@ -1087,6 +1087,17 @@ the in-place change and triggers recomputation regardless."
     (let ((default-directory (file-name-as-directory dir)))
       (apply #'call-process "git" nil t nil args))))
 
+(ert-deftest derivation-buffer-input ()
+  "A buffer input tracks text and its modification tick."
+  (with-temp-buffer
+    (insert "one")
+    (let ((input (derivation-make-buffer-input (current-buffer) "test-buffer")))
+      (should (equal (derivation-input-name input) "test-buffer"))
+      (should (equal (derivation-input-value input) "one"))
+      (goto-char (point-max))
+      (insert "-two")
+      (should (equal (derivation-input-value input) "one-two")))))
+
 (ert-deftest derivation-input-pulls-once-until-invalidated ()
   "Without a stamp, an input pulls once and then on invalidation."
   (let ((pulls 0) (value 1))

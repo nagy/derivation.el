@@ -410,6 +410,26 @@ state (see `derivation--memoizer').  GENERATION counts manual
 invalidations.  ERROR holds the last failure message."
   name pull stamp generation memo error)
 
+(defun derivation--make-input (pull push &optional stamp name poll)
+  "Build a `derivation-input' around PULL and PUSH.
+
+PUSH renders the pulled value and runs only when the value changed.
+Public value inputs pass `ignore'.  STAMP and NAME go to the input.
+POLL non-nil gives the memo no stamp, so every sync pulls (used by
+variable derivers to catch in-place mutations)."
+  (let ((input (derivation--input-create
+                :name name :pull pull :stamp stamp :generation 0)))
+    (setf (derivation-input-memo input)
+          (derivation--memoizer
+           pull push
+           ;; The generation counter makes every input manually
+           ;; invalidatable even when it carries a stamp.
+           (unless poll
+             (lambda ()
+               (list (derivation-input-generation input)
+                     (and stamp (funcall stamp)))))))
+    input))
+
 ;;;###autoload
 (defun derivation-make-input (pull &optional stamp name)
   "Create a memoized live value computed by PULL.
@@ -436,18 +456,24 @@ See `derivation-stamp-or', `derivation-stamp-mtime',
   (when (and stamp (not (functionp stamp)))
     (error "derivation-make-input: STAMP must be a function or nil, got %S"
            (type-of stamp)))
-  (let ((input (derivation--input-create
-                :name name :pull pull :stamp stamp :generation 0)))
-    (setf (derivation-input-memo input)
-          (derivation--memoizer
-           pull #'ignore
-           ;; The generation counter makes every input manually
-           ;; invalidatable even when it carries a stamp.
-           (lambda ()
-             (list (derivation-input-generation input)
-                   (and (derivation-input-stamp input)
-                        (funcall (derivation-input-stamp input)))))))
-    input))
+  (derivation--make-input pull #'ignore stamp name))
+
+;;;###autoload
+(defun derivation-make-buffer-input (buffer &optional name)
+  "Return a live input for BUFFER's accessible text.
+
+The input's stamp is BUFFER's `buffer-chars-modified-tick', so the
+value updates after edits.  NAME defaults to the buffer name."
+  (let ((buffer (if (bufferp buffer) buffer (get-buffer buffer))))
+    (unless (buffer-live-p buffer)
+      (error "derivation-make-buffer-input: buffer is not live"))
+    (derivation--make-input
+     (lambda ()
+       (with-current-buffer buffer
+         (buffer-substring-no-properties (point-min) (point-max))))
+     #'ignore
+     (lambda () (buffer-chars-modified-tick buffer))
+     (or name (buffer-name buffer)))))
 
 (defun derivation-input-value (input)
   "Return the current value of INPUT, pulling again when stale.
@@ -672,18 +698,19 @@ STAMP so the command runs only when its inputs change."
           (derivation--memoizer pull #'ignore effective-stamp))
     input))
 
-(defun derivation--make-buffer-deriver (buf tbuf pull-fn push-fn
+(defun derivation--make-buffer-deriver (buf tbuf input
                                           &optional reset-fn pendingp extra-cleanup)
-  "Wire a memoized buffer deriver from BUF to TBUF.
-PULL-FN computes the target text (may signal `derivation--failed' or
-`derivation--pending'); PUSH-FN renders it.  Memoized on BUF's
-`buffer-chars-modified-tick'.  RESET-FN, when non-nil, aborts any work
-in flight before a forced rerun.  PENDINGP, when non-nil, reports that
-work for the current tick already runs, so staleness checks stay quiet.
-Installs the auto-revert target hooks, registers the deriver with the
-kill-buffer hooks (plus EXTRA-CLEANUP), and returns the deriver."
-  (let* ((memo (derivation--memoizer pull-fn push-fn
-                                     (lambda () (buffer-chars-modified-tick buf))))
+  "Wire a memoized buffer deriver from BUF to TBUF via INPUT.
+
+INPUT is a `derivation-input' whose PUSH-FN renders TBUF; its PULL-FN
+may signal `derivation--failed' or `derivation--pending'.  Memoized on
+the input's stamp (usually BUF's `buffer-chars-modified-tick').
+RESET-FN, when non-nil, aborts any work in flight before a forced
+rerun.  PENDINGP, when non-nil, reports that work for the current
+stamp already runs, so staleness checks stay quiet.  Installs the
+auto-revert target hooks, registers the deriver with the kill-buffer
+hooks (plus EXTRA-CLEANUP), and returns the deriver."
+  (let* ((memo (derivation-input-memo input))
          (live (lambda () (and (buffer-live-p buf) (buffer-live-p tbuf))))
          (dirtyp (lambda ()
                    (and (funcall live)
@@ -814,7 +841,11 @@ before it finishes."
                     (derivation--replace-contents text)
                     (setq-local derivation--error nil)))))
           (derivation--make-buffer-deriver
-           buf tbuf pull push-fn
+           buf tbuf
+           (derivation--make-input
+            pull push-fn
+            (lambda () (buffer-chars-modified-tick buf))
+            (buffer-name buf))
            reset
            (lambda ()
              (let ((tick (buffer-chars-modified-tick buf)))
@@ -828,31 +859,34 @@ before it finishes."
       (let ((errbuf nil))
         (derivation--make-buffer-deriver
          buf tbuf
-         (lambda ()
-           (let ((content (with-current-buffer buf
-                            (buffer-substring-no-properties
-                             (point-min) (point-max)))))
-             (condition-case err
-                 (funcall command content)
-               (error
-                (let ((msg (error-message-string err)))
-                  (unless (buffer-live-p errbuf)
-                    (setq errbuf (generate-new-buffer
-                                  (format " *derivation-err-%s*" (gensym)))))
-                  (with-current-buffer errbuf
-                    (with-silent-modifications
-                      (erase-buffer)
-                      (insert msg)))
-                  (with-current-buffer tbuf
-                    (setq-local derivation--error msg))
-                  (signal 'derivation--failed nil))))))
-         (lambda (text)
-           (with-current-buffer tbuf
-             (derivation--replace-contents text)
-             (setq-local derivation--error nil))
-           (when (buffer-live-p errbuf)
-             (with-current-buffer errbuf
-               (with-silent-modifications (erase-buffer)))))
+         (derivation--make-input
+          (lambda ()
+            (let ((content (with-current-buffer buf
+                             (buffer-substring-no-properties
+                              (point-min) (point-max)))))
+              (condition-case err
+                  (funcall command content)
+                (error
+                 (let ((msg (error-message-string err)))
+                   (unless (buffer-live-p errbuf)
+                     (setq errbuf (generate-new-buffer
+                                   (format " *derivation-err-%s*" (gensym)))))
+                   (with-current-buffer errbuf
+                     (with-silent-modifications
+                       (erase-buffer)
+                       (insert msg)))
+                   (with-current-buffer tbuf
+                     (setq-local derivation--error msg))
+                   (signal 'derivation--failed nil))))))
+          (lambda (text)
+            (with-current-buffer tbuf
+              (derivation--replace-contents text)
+              (setq-local derivation--error nil))
+            (when (buffer-live-p errbuf)
+              (with-current-buffer errbuf
+                (with-silent-modifications (erase-buffer)))))
+          (lambda () (buffer-chars-modified-tick buf))
+          (buffer-name buf))
          nil
          nil
          (lambda ()
@@ -977,22 +1011,28 @@ The returned function takes no arguments and is compatible with
 `derivation-run-hooks': it is automatically registered, and can be
 removed with `derivation-unregister'.
 
-Memoization is hybrid: a variable watcher provides a fast \"not
-dirty\" check, and an `equal' value comparison catches in-place
-mutations that the watcher would miss.
+Memoization: the deriver polls the source value on every pass and
+pushes only when the value changed (`equal' on a copied tree), so
+in-place mutations are caught.  The variable watcher exists for
+refcounted registration, not for skipping the pull.
 
 Registration installs a watcher on FROMVAR.  `derivation-unregister'
 drops the watcher once the last deriver watching FROMVAR is removed."
   (let ((entry (gethash fromvar derivation--var-watch-table))
-        (memo (derivation--memoizer
-               (lambda () (symbol-value fromvar))
-               (lambda (val) (set tovar (funcall func val))))))
+        (input (derivation--make-input
+                (lambda () (symbol-value fromvar))
+                (lambda (val) (set tovar (funcall func val)))
+                nil
+                (symbol-name fromvar)
+                t)))
     ;; Install or bump refcount.
     (if entry
         (cl-incf (cdr entry))
       (puthash fromvar (cons 0 1) derivation--var-watch-table)
       (add-variable-watcher fromvar #'derivation--var-bump))
-    (let ((deriver (lambda () (funcall (derivation--memo-sync memo)))))
+    (let ((deriver (lambda ()
+                     (funcall (derivation--memo-sync
+                               (derivation-input-memo input))))))
       (derivation-register
        deriver
        (lambda ()
@@ -1063,22 +1103,25 @@ Example that filters magit-process to show only failed commands:
       (error "derivation-make-section-filter: source buffer is not live"))
     (derivation--make-buffer-deriver
      buf tbuf
-     (lambda ()
-       (with-current-buffer buf
-         (if (and (boundp 'magit-root-section)
-                  (local-variable-p 'magit-root-section)
-                  magit-root-section)
-             (mapconcat
-              (lambda (section)
-                (with-no-warnings
-                  (buffer-substring (slot-value section 'start)
-                                    (slot-value section 'end))))
-              (derivation--walk-tree magit-root-section predicate t)
-              "\n")
-           (buffer-string))))
-     (lambda (text)
-       (with-current-buffer tbuf
-         (derivation--replace-contents text))))))
+     (derivation--make-input
+      (lambda ()
+        (with-current-buffer buf
+          (if (and (boundp 'magit-root-section)
+                   (local-variable-p 'magit-root-section)
+                   magit-root-section)
+              (mapconcat
+               (lambda (section)
+                 (with-no-warnings
+                   (buffer-substring (slot-value section 'start)
+                                     (slot-value section 'end))))
+               (derivation--walk-tree magit-root-section predicate t)
+               "\n")
+            (buffer-string))))
+      (lambda (text)
+        (with-current-buffer tbuf
+          (derivation--replace-contents text)))
+      (lambda () (buffer-chars-modified-tick buf))
+      (buffer-name buf)))))
 
 (defvar-local derivation--source nil
   "When non-nil, this buffer is a derivation target.

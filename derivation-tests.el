@@ -359,6 +359,23 @@
                     (get-text-property 0 'mouse-face result)))))
     (derivation-test--kill-buffers (list bufs))))
 
+(ert-deftest derivation-mode-line-form-error ()
+  "The :eval form shows the error face and message after a failure."
+  (let* ((bufs (derivation-test--with-buffers "hello"))
+         (src (car bufs))
+         (dst (cdr bufs))
+         (deriver (derivation-make-deriver
+                   (lambda (_content) (error "boom")) src dst)))
+    (funcall deriver)
+    (with-current-buffer dst
+      (should derivation--error)
+      (let ((result (eval (cadr derivation-mode-line))))
+        (should (stringp result))
+        (should (string-match "⟳!" result))
+        (should (eq (get-text-property 0 'face result) 'error))
+        (should (string-match "boom" (get-text-property 0 'help-echo result)))))
+    (derivation-test--kill-buffers (list bufs))))
+
 (ert-deftest derivation-mode-line-form-nil-when-not-set ()
   "The :eval form returns nil in non-derived buffers."
   (with-temp-buffer

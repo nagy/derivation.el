@@ -49,6 +49,7 @@
 - A failed async command retries after `derivation--retry-delay` (default 1s), unless the source tick or input stamp changed. An abandoned command-input job holds its hidden buffers until a read or process exit.
 - `derivation-unregister` and `derivation-process-stop` return before the child exits; the child can outlive the call by up to `:stop-timeout`, then the SIGKILL timer and sentinel finish the state change. `derivation--process-start` is synchronous (`make-process`). Program identity touches the filesystem (and TRAMP) on every process pass.
 - In-place mutations on vectors and hash tables are not caught by `equal` (vectors are handled by `copy-tree cur-val t`; hash tables are not).
+- `format-mode-line` is a deliberate no-op under `emacs --batch`, so the suite tests the `derivation-mode-line` construct by `eval`, not rendered output. A display-backed runner would be needed for rendering tests.
 - `derivation--storage` is a double-dash private var; the public API is `derivation-register`/`derivation-unregister`.  Rename the var to `derivation-storage` eventually.
 
 ## Namespace migration (done)
@@ -100,8 +101,4 @@ Done: both sinks write via `derivation--replace-contents`, which uses `replace-r
 
 Numbered work items for this project.  **Remove items entirely once finished** (no crossing out).
 
-### Cleanup
-
-1. **Test `derivation-mode-line-form-evaluates` tests implementation, not behavior.** It `eval`s `(cadr derivation-mode-line)` directly. A rendering-based test is impossible in the batch suite: `format-mode-line` is a deliberate no-op when `noninteractive` (see `Fformat_mode_line` in xdisp.c), so the rendered string can't be checked under `emacs --batch`. Either keep the eval-based test or move the suite to a display-backed runner.
-
-2. **Minor: stderr capture.** `with-temp-buffer` + `insert-file-contents` for stderr could be a single `insert-file-contents` into a reused buffer.
+No open work items.

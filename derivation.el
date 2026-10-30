@@ -924,6 +924,24 @@ Bound by `derivation--resolve-spec'.")
         (error "Process command element did not resolve to a string: %S" arg)))
     command))
 
+(defun derivation--program-stamp (program directory)
+  "Return PROGRAM's identity, resolving relative paths against DIRECTORY.
+
+The identity is (TRUENAME INODE SIZE MTIME), or nil when PROGRAM
+resolves to no file.  Replacing or retargeting the executable changes
+the stamp, so a running child restarts even when its argv stays the
+same."
+  (let* ((path (if (file-name-directory program)
+                   (expand-file-name program directory)
+                 (executable-find program))))
+    (when path
+      (let ((attrs (file-attributes path)))
+        (when attrs
+          (list (file-truename path)
+                (file-attribute-inode-number attrs)
+                (file-attribute-size attrs)
+                (file-attribute-modification-time attrs)))))))
+
 (defun derivation--resolve-directory (process)
   "Resolve PROCESS's working directory."
   (let ((directory (derivation--resolve-value
@@ -980,11 +998,13 @@ removes VAR from the inherited environment."
 (defun derivation--resolve-spec (process)
   "Resolve PROCESS's spec.  Return (SPEC . INPUTS)."
   (let* ((derivation--resolving-inputs nil)
-         (spec (list :command
-                     (derivation--resolve-command
-                      (derivation-process-command process))
-                     :directory
-                     (derivation--resolve-directory process)
+         (directory (derivation--resolve-directory process))
+         (command (derivation--resolve-command
+                   (derivation-process-command process)))
+         (spec (list :command command
+                     :program (derivation--program-stamp (car command)
+                                                         directory)
+                     :directory directory
                      :environment
                      (derivation--resolve-environment
                       (derivation-process-environment process))))
@@ -1221,9 +1241,12 @@ Resolved inputs are recorded, so expensive values (such as
 \='(\"nix\" \"build\" \"--no-out-link\" \".#docs\")) pull only when their
 own stamp changes.
 
-SPEC is the tuple of resolved command, directory and environment.
-The process restarts when SPEC changes (compared with `equal').  The
-same restart happens after `derivation-process-restart'.
+SPEC is the tuple of resolved command, program identity, directory
+and environment.  The process restarts when SPEC changes (compared
+with `equal').  Program identity covers the executable's truename,
+inode, size and mtime, so replacing or retargeting the binary
+restarts the child even when argv stays the same.  The same restart
+happens after `derivation-process-restart'.
 
 AUTO-RESTART (default t) restarts an unexpectedly exited child with
 delays from BACKOFF (seconds, default 0.5s, 1s, 2s, 5s, capped).

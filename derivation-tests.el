@@ -1251,6 +1251,37 @@ the in-place change and triggers recomputation regardless."
       (when process
         (derivation-test--process-cleanup process)))))
 
+(ert-deftest derivation-process-restarts-on-program-change ()
+  "Replacing the executable at the same path restarts the child."
+  (skip-unless (and (executable-find "sh") (executable-find "sleep")))
+  (let* ((dir (file-name-as-directory (make-temp-file "deriv-prog-" t)))
+         (program (expand-file-name "server" dir))
+         (process nil))
+    (unwind-protect
+        (progn
+          (with-temp-file program
+            (insert "#!/bin/sh\nexec sleep 30\n"))
+          (set-file-modes program #o755)
+          (setq process (derivation-make-process
+                         :name "deriv-test-program"
+                         :command (list program)))
+          (let ((first (derivation-process-process process)))
+            (should (process-live-p first))
+            (derivation-run-hooks)
+            (should (eq (derivation-process-process process) first))
+            (with-temp-file program
+              (insert "#!/bin/sh\n# changed\nexec sleep 30\n"))
+            (set-file-modes program #o755)
+            (set-file-times program (time-add (current-time) 10))
+            (derivation-run-hooks)
+            (let ((second (derivation-process-process process)))
+              (should-not (eq first second))
+              (should (process-live-p second))
+              (should-not (process-live-p first)))))
+      (when process
+        (derivation-test--process-cleanup process))
+      (delete-directory dir t))))
+
 (ert-deftest derivation-process-stop-and-start ()
   "Stop disables and kills the child; start re-enables it."
   (skip-unless (and (executable-find "sh") (executable-find "sleep")))

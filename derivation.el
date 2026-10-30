@@ -115,13 +115,14 @@ resolved runtime spec of the current or last process;
 PENDING-SPEC holds a debounced change.  DERIVER is the function
 registered with `derivation-run-hooks'.  AUTO-RESTART, BACKOFF,
 STOP-SIGNAL, STOP-TIMEOUT and DEBOUNCE are policy options.
-STATUS is one of `:running', `:exited', `:stopped' or `:failed'."
+STATUS is one of `:running', `:stopping', `:exited', `:stopped' or
+`:failed'."
   name command directory environment
-  spec pending-spec inputs
+  spec pending-spec next-spec inputs
   log deriver process
   desired status
   auto-restart backoff stop-signal stop-timeout debounce
-  timer restart-timer restart-count started-at stoppingp
+  timer restart-timer stop-timer restart-count started-at stoppingp
   last-error kill-hook)
 
 (defun derivation-register (deriver &optional cleanup)
@@ -875,6 +876,13 @@ Bound by `derivation--resolve-spec'.")
       (cancel-timer timer)))
   (setf (derivation-process-restart-timer process) nil))
 
+(defun derivation--process-cancel-stop-timer (process)
+  "Cancel PROCESS's pending SIGKILL timer."
+  (let ((timer (derivation-process-stop-timer process)))
+    (when timer
+      (cancel-timer timer)))
+  (setf (derivation-process-stop-timer process) nil))
+
 (defun derivation--process-backoff-cap (process)
   "Return the longest backoff delay of PROCESS, in seconds."
   (float (or (car (last (derivation-process-backoff process))) 5)))
@@ -1019,6 +1027,7 @@ removes VAR from the inherited environment."
         (environment (plist-get spec :environment))
         (log (derivation-process-log process)))
     (derivation--process-cancel-restart-timer process)
+    (derivation--process-cancel-stop-timer process)
     (condition-case err
         (progn
           (when (buffer-live-p log)
@@ -1044,7 +1053,8 @@ removes VAR from the inherited environment."
           (setf (derivation-process-status process) :running
                 (derivation-process-started-at process) (current-time)
                 (derivation-process-stoppingp process) nil
-                (derivation-process-pending-spec process) nil)
+                (derivation-process-pending-spec process) nil
+                (derivation-process-next-spec process) nil)
           (derivation--process-clear-error process)
           t)
       (error
@@ -1055,58 +1065,71 @@ removes VAR from the inherited environment."
            (derivation--process-schedule-restart process))
          nil)))))
 
-(defun derivation--process-stop (process)
-  "Stop PROCESS's child: SIGTERM, bounded wait, then SIGKILL."
+(defun derivation--process-request-stop (process)
+  "Ask PROCESS's child to exit without blocking.
+
+Send STOP-SIGNAL, then schedule SIGKILL after STOP-TIMEOUT.  The
+sentinel finishes the stop: it cancels the SIGKILL timer, clears
+STOPPINGP, and starts NEXT-SPEC when one is pending."
   (let ((proc (derivation-process-process process)))
-    (when (and proc (process-live-p proc))
-      (setf (derivation-process-stoppingp process) t)
-      (unwind-protect
-          (progn
-            (ignore-errors
-              (signal-process proc (or (derivation-process-stop-signal process)
-                                       'SIGTERM)))
-            (let ((deadline (time-add
-                             (current-time)
-                             (or (derivation-process-stop-timeout process) 2))))
-              (while (and (process-live-p proc)
-                          (time-less-p (current-time) deadline))
-                (accept-process-output proc 0.05)))
-            (when (process-live-p proc)
-              (ignore-errors (signal-process proc 'SIGKILL))
-              (let ((deadline (time-add (current-time) 1)))
-                (while (and (process-live-p proc)
-                            (time-less-p (current-time) deadline))
-                  (accept-process-output proc 0.05)))))
-        (setf (derivation-process-stoppingp process) nil)))
-    (setf (derivation-process-status process) :stopped)))
+    (if (and proc (process-live-p proc))
+        (progn
+          (setf (derivation-process-stoppingp process) t
+                (derivation-process-status process) :stopping)
+          (ignore-errors
+            (signal-process proc (or (derivation-process-stop-signal process)
+                                     'SIGTERM)))
+          (derivation--process-cancel-stop-timer process)
+          (let ((timer nil))
+            (setq timer
+                  (run-at-time
+                   (or (derivation-process-stop-timeout process) 2) nil
+                   (lambda ()
+                     (when (eq timer (derivation-process-stop-timer process))
+                       (setf (derivation-process-stop-timer process) nil)
+                       (when (process-live-p proc)
+                         (ignore-errors (signal-process proc 'SIGKILL)))))))
+            (setf (derivation-process-stop-timer process) timer)))
+      (setf (derivation-process-stoppingp process) nil
+            (derivation-process-status process) :stopped))))
 
 (defun derivation--process-sentinel (process proc event)
   "Handle PROC's exit for PROCESS.  EVENT is the sentinel string."
-  (when (and (not (derivation-process-stoppingp process))
-             (eq proc (derivation-process-process process))
+  (when (and (eq proc (derivation-process-process process))
              (not (process-live-p proc)))
-    (if (derivation-process-desired process)
-        (progn
-          (setf (derivation-process-status process) :exited)
-          (unless (equal (process-exit-status proc) 0)
-            (derivation--process-set-error
-             process
-             (format "%s: %s" (derivation-process-name process)
-                     (string-trim event))))
-          (when (derivation-process-auto-restart process)
-            (derivation--process-reset-backoff-if-stable process)
-            (derivation--process-schedule-restart process)))
-      (setf (derivation-process-status process) :stopped))))
+    (derivation--process-cancel-stop-timer process)
+    (let ((next (derivation-process-next-spec process))
+          (was-stopping (derivation-process-stoppingp process)))
+      (setf (derivation-process-stoppingp process) nil
+            (derivation-process-next-spec process) nil)
+      (cond
+       ((and next (derivation-process-desired process))
+        (setf (derivation-process-spec process) next)
+        (derivation--process-start process next))
+       ((or (not (derivation-process-desired process)) was-stopping)
+        (setf (derivation-process-status process) :stopped))
+       (t
+        (setf (derivation-process-status process) :exited)
+        (unless (equal (process-exit-status proc) 0)
+          (derivation--process-set-error
+           process
+           (format "%s: %s" (derivation-process-name process)
+                   (string-trim event))))
+        (when (derivation-process-auto-restart process)
+          (derivation--process-reset-backoff-if-stable process)
+          (derivation--process-schedule-restart process)))))))
 
 (defun derivation--process-fire-pending (process)
   "Start PROCESS's pending spec, if any."
   (let ((pending (derivation-process-pending-spec process)))
-    (when pending
+    (when (and pending (not (derivation-process-stoppingp process)))
       (setf (derivation-process-pending-spec process) nil)
-      (when (derivation-process-live-p process)
-        (derivation--process-stop process))
-      (setf (derivation-process-spec process) pending)
-      (derivation--process-start process pending))))
+      (if (derivation-process-live-p process)
+          (progn
+            (setf (derivation-process-next-spec process) pending)
+            (derivation--process-request-stop process))
+        (setf (derivation-process-spec process) pending)
+        (derivation--process-start process pending)))))
 
 (defun derivation--process-apply (process)
   "Resolve PROCESS's spec and reconcile.  Return non-nil on change."
@@ -1122,9 +1145,13 @@ removes VAR from the inherited environment."
               (derivation--process-clear-error process))
             (cond
              ((not (derivation-process-desired process))
-              (when (derivation-process-live-p process)
-                (derivation--process-stop process)
-                (setq changed t)))
+              (let ((was-live (derivation-process-live-p process))
+                    (had-pending (derivation-process-pending-spec process)))
+                (derivation--process-cancel-timer process)
+                (setf (derivation-process-next-spec process) nil)
+                (derivation--process-request-stop process)
+                (when (or was-live had-pending)
+                  (setq changed t))))
              ((and (derivation-process-pending-spec process)
                    (equal spec (derivation-process-spec process)))
               ;; The spec returned to the running one before the
@@ -1151,9 +1178,13 @@ removes VAR from the inherited environment."
                            (derivation--process-fire-pending process)))))
                 (setf (derivation-process-timer process) timer))
               (setq changed t))
+             ((derivation-process-live-p process)
+              ;; Let the sentinel start SPEC after the old child
+              ;; exits: this frees ports and shared resources first.
+              (setf (derivation-process-next-spec process) spec)
+              (derivation--process-request-stop process)
+              (setq changed t))
              (t
-              (when (derivation-process-live-p process)
-                (derivation--process-stop process))
               (setf (derivation-process-spec process) spec)
               (derivation--process-start process spec)
               (setq changed t))))
@@ -1169,11 +1200,16 @@ removes VAR from the inherited environment."
       changed)))
 
 (defun derivation--process-teardown (process)
-  "Release PROCESS's timers, child and log-buffer hooks."
-  (setf (derivation-process-desired process) nil)
+  "Release PROCESS's timers, child and log-buffer hooks.
+
+The child stop finishes asynchronously: a SIGKILL timer fires when
+needed, and the sentinel clears the state.  The log buffer may already
+be gone by then."
+  (setf (derivation-process-desired process) nil
+        (derivation-process-next-spec process) nil)
   (derivation--process-cancel-timer process)
   (derivation--process-cancel-restart-timer process)
-  (derivation--process-stop process)
+  (derivation--process-request-stop process)
   (let ((log (derivation-process-log process))
         (hook (derivation-process-kill-hook process)))
     (when (buffer-live-p log)
@@ -1185,39 +1221,53 @@ removes VAR from the inherited environment."
         (setq-local revert-buffer-function nil)))))
 
 (defun derivation-process-start (process)
-  "Enable PROCESS and start its child now, resolving the spec."
+  "Enable PROCESS and start its child, resolving the spec if needed."
   (derivation--process-cancel-timer process)
   (derivation--process-cancel-restart-timer process)
   (setf (derivation-process-desired process) t)
-  (unless (derivation-process-live-p process)
-    (pcase-let ((`(,spec . ,inputs) (derivation--resolve-spec process)))
-      (setf (derivation-process-inputs process) inputs
-            (derivation-process-spec process) spec)
-      (derivation--process-start process spec)))
+  (pcase-let ((`(,spec . ,inputs) (derivation--resolve-spec process)))
+    (setf (derivation-process-inputs process) inputs)
+    (cond
+     ((not (derivation-process-live-p process))
+      (setf (derivation-process-spec process) spec)
+      (derivation--process-start process spec))
+     ((derivation-process-stoppingp process)
+      ;; The child is already on its way out: start SPEC after it.
+      (setf (derivation-process-next-spec process) spec))
+     ((not (equal spec (derivation-process-spec process)))
+      (setf (derivation-process-next-spec process) spec)
+      (derivation--process-request-stop process))))
   process)
 
 (defun derivation-process-stop (process)
-  "Disable PROCESS and stop its child.
+  "Disable PROCESS and ask its child to stop, without blocking.
 
-A later `derivation-process-start' re-enables it.  The process deriver
+STOP-SIGNAL fires now, SIGKILL after STOP-TIMEOUT.  A later
+`derivation-process-start' re-enables the process.  The process deriver
 leaves it stopped while it is disabled."
-  (setf (derivation-process-desired process) nil)
+  (setf (derivation-process-desired process) nil
+        (derivation-process-next-spec process) nil)
   (derivation--process-cancel-timer process)
   (derivation--process-cancel-restart-timer process)
-  (derivation--process-stop process)
+  (derivation--process-request-stop process)
   process)
 
 (defun derivation-process-restart (process)
-  "Stop PROCESS and start it again from a freshly resolved spec."
+  "Restart PROCESS from a freshly resolved spec, without blocking.
+
+The old child gets STOP-SIGNAL now.  Its replacement starts from the
+sentinel after the old child exits."
   (setf (derivation-process-desired process) t)
   (derivation--process-cancel-timer process)
   (derivation--process-cancel-restart-timer process)
-  (when (derivation-process-live-p process)
-    (derivation--process-stop process))
   (pcase-let ((`(,spec . ,inputs) (derivation--resolve-spec process)))
-    (setf (derivation-process-inputs process) inputs
-          (derivation-process-spec process) spec)
-    (derivation--process-start process spec))
+    (setf (derivation-process-inputs process) inputs)
+    (if (derivation-process-live-p process)
+        (progn
+          (setf (derivation-process-next-spec process) spec)
+          (derivation--process-request-stop process))
+      (setf (derivation-process-spec process) spec)
+      (derivation--process-start process spec)))
   process)
 
 ;;;###autoload
@@ -1250,16 +1300,20 @@ happens after `derivation-process-restart'.
 
 AUTO-RESTART (default t) restarts an unexpectedly exited child with
 delays from BACKOFF (seconds, default 0.5s, 1s, 2s, 5s, capped).
-Backoff resets after a run longer than the cap.  STOP-SIGNAL (default
-SIGTERM) is followed by SIGKILL after STOP-TIMEOUT seconds (default
-2).  DEBOUNCE delays SPEC-change restarts by that many seconds
-\(default 0, immediate).
+Backoff resets after a run longer than the cap.  Every stop is
+asynchronous: STOP-SIGNAL (default SIGTERM) fires now, SIGKILL
+follows after STOP-TIMEOUT seconds (default 2), and the replacement
+starts from the sentinel after the old child exits, so ports and
+shared resources free first.  DEBOUNCE delays SPEC-change restarts
+by that many seconds \(default 0, immediate).
 
 The deriver is registered automatically and reconciles on the
 `derivation-run-hooks' schedule.  The child's stdout and stderr go to
 a hidden log buffer with `derivation-mode-line' support; killing that
 buffer stops the process.  `derivation-unregister' accepts the
-returned handle and stops the child.
+returned handle and asks the child to stop; the child can outlive the
+call by up to STOP-TIMEOUT.  STATUS `:stopping' means the exit is in
+flight.
 
 Returns a `derivation-process' handle.  Use `derivation-process-process',
 `derivation-process-status', `derivation-process-log',

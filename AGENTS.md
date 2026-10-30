@@ -19,7 +19,7 @@
 - `derivation-make` takes `(pull-fn push-fn &optional stamp-fn)` — the generic data-deriver primitive. `pull-fn` returns the derived data (a pure scan of global state); `push-fn` renders it and is responsible for selecting its target buffer. Memoized on `equal` of the data (`copy-tree`ed); with `stamp-fn` the pull is skipped while the stamp is unchanged. Does NOT self-register — callers pass the result to `derivation-register`.
 - `derivation-make-input` takes `(pull &optional stamp name)` and returns a `derivation-input`: a memoized live value. `derivation-input-value` pulls only when the stamp changed or after `derivation-input-invalidate`; with no stamp the input pulls once, then only on invalidation. A stamp is a zero-arg function returning an `equal`-comparable value. Stamps compose via `derivation-stamp-or`; helpers: `derivation-stamp-always`, `derivation-stamp-mtime`, `derivation-stamp-files`, `derivation-stamp-git` (HEAD + tracked dirt, untracked files ignored like Nix flakes). Errors signal `derivation--failed`, keep the last good value, and land in `derivation-input-error`.
 - `derivation-make-command-input` takes `(command &key directory environment stamp transform name)`: one-shot `call-process`, stdout captured, default `transform` is `string-trim`, nonzero exit signals `derivation--failed` with stderr. Synchronous. Use it for one-shot value producers such as `nix build --no-out-link`.
-- `derivation-make-process` takes keyword args `:name :command :directory :environment :auto-restart :backoff :stop-signal :stop-timeout :debounce` and returns a `derivation-process` handle. `:command` is a non-empty list; its elements, `:directory`, and `(VAR . VALUE)` environment values may be strings, `derivation-input`s or functions. Resolution records the inputs it reads. SPEC = resolved `(:command ... :program ... :directory ... :environment ...)`, compared with `equal`: a change stops the child (SIGTERM, bounded wait, SIGKILL) and starts the new one. `:program` holds the executable's truename, inode, size and mtime (`derivation--program-stamp`), so replacing or retargeting the binary restarts the child even when argv stays the same. The deriver self-registers and reconciles on `derivation-run-hooks`; `derivation-unregister` accepts the handle. Output goes to a hidden log buffer with `derivation--source`/mode-line support; killing that buffer unregisters. Auto-restart backs off 0.5/1/2/5s and resets after a stable run.
+- `derivation-make-process` takes keyword args `:name :command :directory :environment :auto-restart :backoff :stop-signal :stop-timeout :debounce` and returns a `derivation-process` handle. `:command` is a non-empty list; its elements, `:directory`, and `(VAR . VALUE)` environment values may be strings, `derivation-input`s or functions. Resolution records the inputs it reads. SPEC = resolved `(:command ... :program ... :directory ... :environment ...)`, compared with `equal`: a change asks the old child to stop (STOP-SIGNAL now, SIGKILL after STOP-TIMEOUT) and the sentinel starts the replacement after the old child exits. `:program` holds the executable's truename, inode, size and mtime (`derivation--program-stamp`), so replacing or retargeting the binary restarts the child even when argv stays the same. The deriver self-registers and reconciles on `derivation-run-hooks`; `derivation-unregister` accepts the handle. Output goes to a hidden log buffer with `derivation--source`/mode-line support; killing that buffer unregisters. Auto-restart backs off 0.5/1/2/5s and resets after a stable run. STATUS `:stopping` means the exit is in flight.
 - Environment entries resolve to `"VAR=VALUE"` strings or `(VAR)` for unset. The spec stores only these entries; the inherited `process-environment` joins at start, so ambient env changes do not trigger restarts.
 - `derivation--memoizer` also exposes a VALUE closure (dirty check + sync + last data), so `derivation-input` reuses the primitive instead of a second memo implementation. An input folds a generation counter plus its stamp into the memo stamp, so manual invalidation works even with a stamp.
 - `derivation-make-tabulated` takes `(entries-fn format &key name sort-key)` — a live `tabulated-list-mode` buffer. `entries-fn` returns `tabulated-list-entries` rows; the deriver polls on the runner schedule and re-renders only on change. Non-idempotent: each call makes a fresh buffer (`generate-new-buffer-name`) and registers a fresh deriver that unregisters when the buffer is killed; renders once at creation; returns the buffer. Errors keep the last good table and set `derivation--error`.
@@ -44,7 +44,7 @@
 ## Known limitations (current session)
 
 - Buffer source derivers poll via idle timer, or — opt-in — via `auto-revert-mode` using the installed `buffer-stale-function`. Long-running commands block Emacs (sync `call-process-region`). `derivation-make-command-input` runs synchronously too, so an expensive command blocks Emacs during the pull.
-- `derivation--process-stop` blocks up to `:stop-timeout` (default 2s) plus a 1s SIGKILL wait. `derivation--process-start` is synchronous (`make-process`); only crash restarts run from timers. Program identity touches the filesystem (and TRAMP) on every process pass.
+- `derivation-unregister` and `derivation-process-stop` return before the child exits; the child can outlive the call by up to `:stop-timeout`, then the SIGKILL timer and sentinel finish the state change. `derivation--process-start` is synchronous (`make-process`). Program identity touches the filesystem (and TRAMP) on every process pass.
 - In-place mutations on vectors and hash tables are not caught by `equal` (vectors are handled by `copy-tree cur-val t`; hash tables are not).
 - `derivation--storage` is a double-dash private var; the public API is `derivation-register`/`derivation-unregister`.  Rename the var to `derivation-storage` eventually.
 
@@ -73,7 +73,7 @@ Buffer source stamps on `buffer-chars-modified-tick`; the variable deriver stamp
 
 ### Process sink
 
-Done: `derivation-make-process` reconciles a child against a spec resolved from inputs. Remaining: async start/stop without the bounded blocking wait, program identity in the spec (truename + mtime), and an `:on-change` hook for SIGHUP reloads instead of restarts.
+Done: `derivation-make-process` reconciles a child against a spec resolved from inputs. Async stop (STOP-SIGNAL now, SIGKILL timer, sentinel starts the replacement), program identity and debounce landed. Remaining: an `:on-change` hook for SIGHUP reloads instead of restarts.
 
 ### Push, not poll
 
@@ -81,9 +81,9 @@ Use `after-change-functions` (or `track-changes` library, available since Emacs 
 
 The `buffer-stale-function` / `revert-buffer-function` integration is the first step toward letting `auto-revert-mode` replace the package's idle timer for buffer derivers. Data derivers (`derivation-make`, `derivation-make-tabulated`) have no cheap stamp; migrating them onto the same hooks would require a polling staleness check or a real change notification.
 
-### Async processes
+### Async buffer commands
 
-`make-process` + sentinel with a generation counter to discard stale results. `call-process-region` freezes the UI on every keystroke-then-idle for slow commands.
+Buffer derivers and `derivation-make-command-input` still run external commands via `call-process-region`/`call-process`, which freezes the UI on slow commands. Use `make-process` + sentinel with a generation counter to discard stale results. Process start/stop already async.
 
 ### replace-buffer-contents
 
@@ -99,7 +99,7 @@ Numbered work items for this project.  **Remove items entirely once finished** (
 
 ### API / design
 
-1. **Async processes.** `make-process` + sentinel with a generation counter to discard stale results. `call-process-region` freezes the UI on every keystroke-then-idle for slow commands.
+1. **Async buffer commands.** `derivation-make-deriver` and `derivation-make-command-input` still run external commands via `call-process-region`/`call-process`, which freezes the UI on slow commands. Use `make-process` + sentinel with a generation counter to discard stale results. Process start/stop already async.
 
 2. **Wire inputs into existing derivers.** `derivation--make-buffer-deriver` and `derivation-make-var-deriver` still build stamps by hand; a buffer input and a variable input would unify them under `derivation-input` (buffer tick, watcher generation).
 

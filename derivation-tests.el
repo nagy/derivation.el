@@ -1190,8 +1190,10 @@ the in-place change and triggers recomputation regardless."
     (funcall predicate)))
 
 (defun derivation-test--process-cleanup (process)
-  "Unregister PROCESS and kill its log buffer."
+  "Unregister PROCESS, wait for its child, then kill the log buffer."
   (ignore-errors (derivation-unregister process))
+  (derivation-test--wait-for
+   (lambda () (not (derivation-process-live-p process))) 5)
   (let ((log (derivation-process-log process)))
     (when (buffer-live-p log)
       (kill-buffer log))))
@@ -1242,8 +1244,12 @@ the in-place change and triggers recomputation regardless."
             (setq arg "two")
             (derivation-input-invalidate input)
             (derivation-run-hooks)
+            (should (derivation-test--wait-for
+                     (lambda ()
+                       (let ((second (derivation-process-process process)))
+                         (and (not (eq first second))
+                              (process-live-p second))))))
             (let ((second (derivation-process-process process)))
-              (should-not (eq first second))
               (should (process-live-p second))
               (should-not (process-live-p first))
               (should (equal (process-command second)
@@ -1274,8 +1280,12 @@ the in-place change and triggers recomputation regardless."
             (set-file-modes program #o755)
             (set-file-times program (time-add (current-time) 10))
             (derivation-run-hooks)
+            (should (derivation-test--wait-for
+                     (lambda ()
+                       (let ((second (derivation-process-process process)))
+                         (and (not (eq first second))
+                              (process-live-p second))))))
             (let ((second (derivation-process-process process)))
-              (should-not (eq first second))
               (should (process-live-p second))
               (should-not (process-live-p first)))))
       (when process
@@ -1292,7 +1302,8 @@ the in-place change and triggers recomputation regardless."
                          :name "deriv-test-stop-start"
                          :command '("sh" "-c" "exec sleep 30")))
           (derivation-process-stop process)
-          (should-not (derivation-process-live-p process))
+          (should (derivation-test--wait-for
+                   (lambda () (not (derivation-process-live-p process)))))
           (should (eq (derivation-process-status process) :stopped))
           (derivation-run-hooks)
           (should-not (derivation-process-live-p process))
@@ -1302,6 +1313,34 @@ the in-place change and triggers recomputation regardless."
       (when process
         (derivation-test--process-cleanup process)))))
 
+(ert-deftest derivation-process-stop-does-not-block ()
+  "Stop returns before the child exits; SIGKILL follows the timeout."
+  (skip-unless (and (executable-find "sh") (executable-find "sleep")))
+  (let* ((dir (file-name-as-directory (make-temp-file "deriv-stop-" t)))
+         (ready (expand-file-name "ready" dir))
+         (process nil))
+    (unwind-protect
+        (progn
+          (setq process
+                (derivation-make-process
+                 :name "deriv-test-stop-async"
+                 :command (list "sh" "-c"
+                                "trap '' TERM; : > \"$1\"; while :; do sleep 1; done"
+                                "sh" ready)
+                 :stop-timeout 0.3))
+          (should (derivation-test--wait-for
+                   (lambda () (file-exists-p ready))))
+          (derivation-process-stop process)
+          ;; The child ignores TERM, so it survives the non-blocking call.
+          (should (derivation-process-live-p process))
+          (should (eq (derivation-process-status process) :stopping))
+          (should (derivation-test--wait-for
+                   (lambda () (not (derivation-process-live-p process))) 3))
+          (should (eq (derivation-process-status process) :stopped)))
+      (when process
+        (derivation-test--process-cleanup process))
+      (delete-directory dir t))))
+
 (ert-deftest derivation-process-unregister-stops ()
   "Unregistering the handle stops the child and drops the deriver."
   (skip-unless (and (executable-find "sh") (executable-find "sleep")))
@@ -1310,7 +1349,8 @@ the in-place change and triggers recomputation regardless."
                    :command '("sh" "-c" "exec sleep 30")))
          (deriver (derivation-process-deriver process)))
     (derivation-unregister process)
-    (should-not (derivation-process-live-p process))
+    (should (derivation-test--wait-for
+             (lambda () (not (derivation-process-live-p process)))))
     (should-not (assq deriver derivation--storage))
     (derivation-test--process-cleanup process)))
 
@@ -1322,7 +1362,8 @@ the in-place change and triggers recomputation regardless."
                    :command '("sh" "-c" "exec sleep 30")))
          (deriver (derivation-process-deriver process)))
     (kill-buffer (derivation-process-log process))
-    (should-not (derivation-process-live-p process))
+    (should (derivation-test--wait-for
+             (lambda () (not (derivation-process-live-p process)))))
     (should-not (assq deriver derivation--storage))
     (derivation-test--process-cleanup process)))
 
@@ -1390,7 +1431,8 @@ the in-place change and triggers recomputation regardless."
             (derivation-process-stop process)
             (should-not (derivation-process-pending-spec process))
             (should-not (derivation-process-timer process))
-            (sleep-for 0.1)
+            (should (derivation-test--wait-for
+                     (lambda () (not (derivation-process-live-p process)))))
             (should-not (derivation-process-live-p process))))
       (when process
         (derivation-test--process-cleanup process)))))

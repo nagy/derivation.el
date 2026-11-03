@@ -589,6 +589,7 @@ repository without commits stamps HEAD as nil."
 
 Entries are \"VAR=VALUE\" strings or (VAR . VALUE) conses with string
 values.  A nil VALUE becomes (VAR), which unsets the variable."
+  (declare (pure t) (side-effect-free t))
   (let ((entries nil))
     (dolist (entry forms)
       (cond
@@ -1154,11 +1155,13 @@ This sets TBUF's buffer-local `buffer-stale-function' and
 
 (defun derivation-process-live-p (process)
   "Return non-nil when PROCESS has a live child."
+  (declare (side-effect-free t))
   (let ((proc (derivation-process-process process)))
     (and proc (process-live-p proc))))
 
 (defun derivation-process-exit-status (process)
   "Return the exit status of PROCESS's last child, or nil."
+  (declare (side-effect-free t))
   (let ((proc (derivation-process-process process)))
     (when proc (process-exit-status proc))))
 
@@ -1302,6 +1305,7 @@ is nil: the variable is then removed from the inherited environment."
 
 ENTRIES shadows inherited variables of the same name.  An (VAR) entry
 removes VAR from the inherited environment."
+  (declare (side-effect-free t))
   (let ((inherited process-environment)
         (additions nil)
         (names nil))
@@ -1730,6 +1734,7 @@ and `derivation-process-restart' to control it."
 
 (defun derivation--source-label (source)
   "Return a display name for SOURCE, a buffer or a string label."
+  (declare (side-effect-free t))
   (if (bufferp source) (buffer-name source) source))
 
 (defvar-local derivation--error nil

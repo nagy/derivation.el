@@ -1,4 +1,4 @@
-;;; derivation.el --- Live buffer and variable derivation -*- lexical-binding: t -*-
+;;; derivation.el --- Live buffer and variable derivation  -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026  Daniel Nagy
 
@@ -106,8 +106,8 @@
   "List of (DERIVER . CLEANUP-FN) records, most recently registered first.
 DERIVER is a function returned by `derivation-make-deriver',
 `derivation-make-var-deriver' or `derivation-make-section-filter'.
-CLEANUP-FN, when non-nil, uninstalls the deriver's kill-buffer hooks;
-it is called by `derivation-unregister'.
+CLEANUP-FN, when non-nil, removes the deriver's `kill-buffer-hook'
+entries; it is called by `derivation-unregister'.
 
 Never manipulate this list directly: use `derivation-register' and
 `derivation-unregister'.")
@@ -132,10 +132,10 @@ ON-CHANGE are policy options.  STATUS is one of `:starting',
 
 (defun derivation-register (deriver &optional cleanup)
   "Register DERIVER so `derivation-run-hooks' runs it.
-
-CLEANUP is a function that uninstalls DERIVER's kill-buffer hooks
-(see `derivation--register-kill-hooks').  It is optional for derivers
-with no buffer lifecycle (e.g. variable derivers).
+CLEANUP is a function that removes DERIVER's `kill-buffer-hook'
+entries, as set up by `derivation--register-kill-hooks'.  It is
+optional for derivers with no buffer lifecycle (e.g. variable
+derivers).
 
 Returns DERIVER."
   (unless (functionp deriver)
@@ -261,12 +261,12 @@ stderr text on failure."
                   text)))))))
 
 (defun derivation--command-start (command args content tick)
-  "Start COMMAND with ARGS.  CONTENT feeds stdin, or nil for /dev/null.
-
-CONTENT goes to a temp file, so stdin stays seekable (some filters
-read it twice).  TICK is recorded for the caller's staleness checks.
-A failure to start the program becomes a completed command with an
-ERROR, so the usual pull path reports it."
+  "Start COMMAND with ARGS.
+CONTENT feeds stdin, or /dev/null when nil.  A non-nil CONTENT goes
+to a temp file, so stdin stays seekable (some filters read it twice).
+TICK is recorded for the caller's staleness checks.  A failure to
+start the program becomes a completed command with an ERROR, so the
+usual pull path reports it."
   (let* ((stdin-file (and content (make-temp-file "derivation-stdin-")))
          (stdout (generate-new-buffer " *derivation-stdout*"))
          (stderr (generate-new-buffer " *derivation-stderr*"))
@@ -340,7 +340,6 @@ DIRTYP, SYNC, FORCE and VALUE are closures; see `derivation--memoizer'."
 
 (defun derivation--memoizer (pull-fn push-fn &optional stamp-fn)
   "Build memoization state for PULL-FN/PUSH-FN versioned by STAMP-FN.
-
 Return a `derivation--memo' with four closures:
 
   DIRTYP  non-nil when the stamp changed since the last commit (always
@@ -412,7 +411,6 @@ invalidations.  ERROR holds the last failure message."
 
 (defun derivation--make-input (pull push &optional stamp name poll)
   "Build a `derivation-input' around PULL and PUSH.
-
 PUSH renders the pulled value and runs only when the value changed.
 Public value inputs pass `ignore'.  STAMP and NAME go to the input.
 POLL non-nil gives the memo no stamp, so every sync pulls (used by
@@ -433,7 +431,6 @@ variable derivers to catch in-place mutations)."
 ;;;###autoload
 (defun derivation-make-input (pull &optional stamp name)
   "Create a memoized live value computed by PULL.
-
 PULL is called with no arguments and returns the value.  STAMP is a
 zero-argument function returning an `equal'-comparable value: the
 input pulls again only when STAMP changed.  With STAMP nil the input
@@ -461,7 +458,6 @@ See `derivation-stamp-or', `derivation-stamp-mtime',
 ;;;###autoload
 (defun derivation-make-buffer-input (buffer &optional name)
   "Return a live input for BUFFER's accessible text.
-
 The input's stamp is BUFFER's `buffer-chars-modified-tick', so the
 value updates after edits.  NAME defaults to the buffer name."
   (let ((buffer (if (bufferp buffer) buffer (get-buffer buffer))))
@@ -477,7 +473,6 @@ value updates after edits.  NAME defaults to the buffer name."
 
 (defun derivation-input-value (input)
   "Return the current value of INPUT, pulling again when stale.
-
 When PULL fails, the last good value stays cached, the message lands
 in `derivation-input-error', and the `derivation--failed' signal
 propagates.  While asynchronous work runs, this signals
@@ -497,7 +492,6 @@ value."
 
 (defun derivation-input-wait (input &optional timeout)
   "Return INPUT's value, waiting for asynchronous work to finish.
-
 Blocks up to TIMEOUT seconds (default 30) by pumping process output.
 Use this only when you need the value now; derivations and process
 specs should let `derivation--pending' propagate instead."
@@ -524,7 +518,8 @@ specs should let `derivation--pending' propagate instead."
   (funcall (derivation--memo-dirtyp (derivation-input-memo input))))
 
 (defun derivation-input-invalidate (input)
-  "Mark INPUT stale.  The next `derivation-input-value' pulls again.
+  "Mark INPUT stale.
+The next `derivation-input-value' pulls again.
 
 Returns INPUT, so calls chain."
   (unless (derivation-input-p input)
@@ -539,7 +534,6 @@ Returns INPUT, so calls chain."
 
 (defun derivation-stamp-or (&rest stamps)
   "Return a stamp that changes when any of STAMPS changes.
-
 STAMPS are zero-argument functions.  The result returns a list of
 their values, so it is `equal'-comparable."
   (dolist (stamp stamps)
@@ -549,7 +543,6 @@ their values, so it is `equal'-comparable."
 
 (defun derivation-stamp-mtime (file)
   "Return a stamp over FILE's modification time.
-
 A missing FILE stamps as nil, so creating it counts as a change."
   (let ((file (expand-file-name file)))
     (lambda ()
@@ -561,7 +554,7 @@ A missing FILE stamps as nil, so creating it counts as a change."
   (apply #'derivation-stamp-or (mapcar #'derivation-stamp-mtime files)))
 
 (defun derivation--git-output (directory args)
-  "Run git with ARGS in DIRECTORY.  Return output, or nil on failure."
+  "Run git with ARGS in DIRECTORY and return its output, or nil on failure."
   (with-temp-buffer
     (let* ((default-directory (file-name-as-directory
                                (expand-file-name directory)))
@@ -571,7 +564,6 @@ A missing FILE stamps as nil, so creating it counts as a change."
 
 (defun derivation-stamp-git (directory)
   "Return a stamp over DIRECTORY's git HEAD and tracked modifications.
-
 Untracked files are ignored, matching what Nix flakes see.  A
 repository without commits stamps HEAD as nil."
   (unless (executable-find "git")
@@ -586,7 +578,6 @@ repository without commits stamps HEAD as nil."
 ;;;###autoload
 (defun derivation--command-environment (forms)
   "Resolve command-input environment FORMS.
-
 Entries are \"VAR=VALUE\" strings or (VAR . VALUE) conses with string
 values.  A nil VALUE becomes (VAR), which unsets the variable."
   (declare (pure t) (side-effect-free t))
@@ -606,7 +597,6 @@ values.  A nil VALUE becomes (VAR), which unsets the variable."
 (cl-defun derivation-make-command-input (command &key directory environment
                                                  stamp transform name)
   "Create a live value from the stdout of a one-shot COMMAND.
-
 COMMAND is a list (PROGRAM ARG...).  It runs asynchronously via
 `make-process'.  `derivation-input-value' signals
 `derivation--pending' until the command finishes; use
@@ -702,15 +692,14 @@ STAMP so the command runs only when its inputs change."
 (defun derivation--make-buffer-deriver (buf tbuf input
                                           &optional reset-fn pendingp extra-cleanup)
   "Wire a memoized buffer deriver from BUF to TBUF via INPUT.
-
 INPUT is a `derivation-input' whose PUSH-FN renders TBUF; its PULL-FN
 may signal `derivation--failed' or `derivation--pending'.  Memoized on
 the input's stamp (usually BUF's `buffer-chars-modified-tick').
 RESET-FN, when non-nil, aborts any work in flight before a forced
 rerun.  PENDINGP, when non-nil, reports that work for the current
 stamp already runs, so staleness checks stay quiet.  Installs the
-auto-revert target hooks, registers the deriver with the kill-buffer
-hooks (plus EXTRA-CLEANUP), and returns the deriver."
+auto-revert target hooks, registers the deriver's `kill-buffer-hook'
+entries (plus EXTRA-CLEANUP), and returns the deriver."
   (let* ((memo (derivation-input-memo input))
          (live (lambda () (and (buffer-live-p buf) (buffer-live-p tbuf))))
          (dirtyp (lambda ()
@@ -739,7 +728,6 @@ hooks (plus EXTRA-CLEANUP), and returns the deriver."
 ;;;###autoload
 (defun derivation-make-deriver (command frombuf tobuf &rest args)
   "Create a memoized function that derives TOBUF from FROMBUF via COMMAND.
-
 FROMBUF and TOBUF may be buffers or buffer names.
 
 COMMAND may be:
@@ -899,7 +887,6 @@ before it finishes."
 ;;;###autoload
 (defun derivation-make (pull-fn push-fn &optional stamp-fn)
   "Create a memoized deriver that PULL-FN pulls and PUSH-FN pushes.
-
 PULL-FN is called with no arguments and returns the derived data
 \(typically a pure scan of global state).  PUSH-FN is called with
 the data and must render it into its target; it is responsible for
@@ -924,7 +911,6 @@ to `derivation-register' (or `derivation-unregister') explicitly."
 ;;;###autoload
 (cl-defun derivation-make-tabulated (entries-fn format &key name sort-key)
   "Create a live `tabulated-list-mode' buffer derived from ENTRIES-FN.
-
 ENTRIES-FN is called with no arguments and must return
 `tabulated-list-entries': a list of (ID [COLS...]).
 
@@ -1004,7 +990,6 @@ Installed as a variable watcher.  _OP is the change operation
 ;;;###autoload
 (defun derivation-make-var-deriver (func fromvar tovar)
   "Create a memoized function that derives TOVAR from FROMVAR via FUNC.
-
 FUNC is called with the value of FROMVAR as its sole argument.
 The return value is assigned to TOVAR via `set'.
 
@@ -1072,10 +1057,9 @@ itself, only to its descendants."
 ;;;###autoload
 (defun derivation-make-section-filter (predicate frombuf tobuf)
   "Create a memoized function that copies matching sections to TOBUF.
-
 FROMBUF is a buffer using magit-section (e.g., a magit buffer).
-PREDICATE is called with each child section of FROMBUF's root
-(with FROMBUF current).  Sections for which PREDICATE returns
+PREDICATE is called with each child section of FROMBUF's root, with
+FROMBUF current.  Sections for which PREDICATE returns
 non-nil have their buffer text (including text properties)
 copied to TOBUF, separated by newlines.
 
@@ -1084,7 +1068,7 @@ The returned function takes no arguments and is compatible with
 removed with `derivation-unregister'.  The deriver is unregistered
 automatically when FROMBUF or TOBUF is killed.
 
-Memoization is keyed on FROMBUF's buffer-chars-modified-tick.
+Memoization is keyed on FROMBUF's `buffer-chars-modified-tick'.
 
 Example that filters magit-process to show only failed commands:
 
@@ -1254,7 +1238,6 @@ This sets TBUF's buffer-local `buffer-stale-function' and
 
 (defun derivation--program-stamp (program directory)
   "Return PROGRAM's identity, resolving relative paths against DIRECTORY.
-
 The identity is (TRUENAME INODE SIZE MTIME), or nil when PROGRAM
 resolves to no file.  Replacing or retargeting the executable changes
 the stamp, so a running child restarts even when its argv stays the
@@ -1280,7 +1263,6 @@ same."
 
 (defun derivation--resolve-environment (forms)
   "Resolve FORMS into environment entries.
-
 FORMS is a list of \"VAR=VALUE\" strings or (VAR . VALUE) conses.
 Each entry resolves to a \"VAR=VALUE\" string, or to (VAR) when VALUE
 is nil: the variable is then removed from the inherited environment."
@@ -1302,7 +1284,6 @@ is nil: the variable is then removed from the inherited environment."
 
 (defun derivation--process-environment (entries)
   "Build `process-environment' from resolved ENTRIES.
-
 ENTRIES shadows inherited variables of the same name.  An (VAR) entry
 removes VAR from the inherited environment."
   (declare (side-effect-free t))
@@ -1325,7 +1306,7 @@ removes VAR from the inherited environment."
     (append (nreverse additions) inherited)))
 
 (defun derivation--resolve-spec (process)
-  "Resolve PROCESS's spec.  Return (SPEC . INPUTS)."
+  "Resolve PROCESS's spec into a (SPEC . INPUTS) cons."
   (let* ((derivation--resolving-inputs nil)
          (directory (derivation--resolve-directory process))
          (command (derivation--resolve-command
@@ -1342,7 +1323,8 @@ removes VAR from the inherited environment."
     (cons spec inputs)))
 
 (defun derivation--process-start (process spec)
-  "Start PROCESS's child from SPEC.  Return non-nil on success."
+  "Start PROCESS's child from SPEC.
+Return non-nil on success."
   (let ((command (plist-get spec :command))
         (directory (plist-get spec :directory))
         (environment (plist-get spec :environment))
@@ -1388,7 +1370,6 @@ removes VAR from the inherited environment."
 
 (defun derivation--process-request-stop (process)
   "Ask PROCESS's child to exit without blocking.
-
 Send STOP-SIGNAL, then schedule SIGKILL after STOP-TIMEOUT.  The
 sentinel finishes the stop: it cancels the SIGKILL timer, clears
 STOPPINGP, and starts NEXT-SPEC when one is pending."
@@ -1415,7 +1396,8 @@ STOPPINGP, and starts NEXT-SPEC when one is pending."
             (derivation-process-status process) :stopped))))
 
 (defun derivation--process-sentinel (process proc event)
-  "Handle PROC's exit for PROCESS.  EVENT is the sentinel string."
+  "Handle PROC's exit for PROCESS.
+EVENT is the sentinel string."
   (when (and (eq proc (derivation-process-process process))
              (not (process-live-p proc)))
     (derivation--process-cancel-stop-timer process)
@@ -1448,7 +1430,6 @@ STOPPINGP, and starts NEXT-SPEC when one is pending."
 
 (defun derivation--process-change (process spec)
   "Apply SPEC to PROCESS, reloading or restarting the child.
-
 With a live child and an ON-CHANGE hook, call the hook with the old
 and new spec.  A nil result keeps the child and records SPEC, so the
 hook can reload in place.  `:restart' (or t) stops and restarts.
@@ -1477,8 +1458,7 @@ hook, the child restarts whenever SPEC changes."
     t))
 
 (defun derivation--process-apply (process &optional force)
-  "Resolve PROCESS's spec and reconcile.  Return non-nil on change.
-
+  "Reconcile PROCESS against its resolved spec and return non-nil on change.
 FORCE skips the debounce delay; the debounce timer uses it."
   (unless (or (derivation-process-stoppingp process)
               (and (not (derivation-process-desired process))
@@ -1550,7 +1530,6 @@ FORCE skips the debounce delay; the debounce timer uses it."
 
 (defun derivation--process-teardown (process)
   "Release PROCESS's timers, child and log-buffer hooks.
-
 The child stop finishes asynchronously: a SIGKILL timer fires when
 needed, and the sentinel clears the state.  The log buffer may already
 be gone by then."
@@ -1594,7 +1573,6 @@ be gone by then."
 
 (defun derivation-process-stop (process)
   "Disable PROCESS and ask its child to stop, without blocking.
-
 STOP-SIGNAL fires now, SIGKILL after STOP-TIMEOUT.  A later
 `derivation-process-start' re-enables the process.  The process deriver
 leaves it stopped while it is disabled."
@@ -1607,7 +1585,6 @@ leaves it stopped while it is disabled."
 
 (defun derivation-process-restart (process)
   "Restart PROCESS from a freshly resolved spec, without blocking.
-
 The old child gets STOP-SIGNAL now.  Its replacement starts from the
 sentinel after the old child exits."
   (setf (derivation-process-desired process) t)
@@ -1636,10 +1613,11 @@ sentinel after the old child exits."
                                         (debounce 0)
                                         on-change)
   "Create a long-running child process derived from a live spec.
-
-COMMAND is a non-empty list (PROGRAM ARG...).  Each COMMAND element
-may be a string, a `derivation-input' or a function returning one.
-DIRECTORY may be a string, a `derivation-input' or a function.
+COMMAND is a non-empty list (PROGRAM ARG...).  NAME is the process
+name (default: the nondirectory part of PROGRAM, or
+\"derivation-process\" when that is not a string).  Each COMMAND
+element may be a string, a `derivation-input' or a function returning
+one.  DIRECTORY may be a string, a `derivation-input' or a function.
 ENVIRONMENT is a list of \"VAR=VALUE\" strings or (VAR . VALUE)
 conses; VALUE may be a string, a `derivation-input' or a function,
 and a nil VALUE unsets VAR.  DIRECTORY defaults to the
@@ -1815,8 +1793,8 @@ For data derivations whose source is a string label, report it."
 (defun derivation-run-hooks ()
   "Run all derivers in `derivation--storage' to a fixpoint.
 Intended to be called from an idle timer or manually.  Repeatedly
-runs the derivers until a pass produces no change, so pipelines
-(A→B→C) converge in a single call, not N idle cycles.  Capped at
+runs the derivers until a pass produces no change, so a pipeline
+A→B→C converges in a single call, not N idle cycles.  Capped at
 `derivation--max-passes' iterations per call.
 
 Errors in individual derivers are caught and reported without
@@ -1828,7 +1806,7 @@ aborting the remaining derivers."
       (setq passes (1+ passes)))))
 
 (defun derivation--run-one-pass ()
-  "Run all derivers once.  Return non-nil if any deriver changed state."
+  "Run all derivers once and report whether any deriver changed state."
   (let ((changed nil)
         (records (copy-sequence derivation--storage)))
     (dolist (rec records)

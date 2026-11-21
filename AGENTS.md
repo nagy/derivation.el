@@ -17,7 +17,7 @@ newer, for `replace-region-contents`. License: AGPL-3.0-or-later.
 
 ## Build and test
 
-- `nix build` — package plus ERT suite plus the treefmt check. Gate for a commit.
+- `nix build` — the gate. Run before a commit.
 - `nix flake check` — the same checks.
 - `nix develop` — dev shell with a real Emacs.
 - `nix fmt` — treefmt.

@@ -62,6 +62,7 @@
           {
             packages.derivation = melpaBuild {
               pname = "derivation";
+              preferLocalBuild = true;
               version = src-version;
 
               src = lib.cleanSource ./.;

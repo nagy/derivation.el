@@ -78,8 +78,22 @@
 
               checkPhase = ''
                 runHook preCheck
-                emacs --batch -L . \
-                  -l derivation-tests.el \
+                # melpaBuild stages only the root *.el files, so the test tree
+                # has to come back before the glob below can match it.
+                cp -r ${./test} ./test
+                # printf repeats "-l %s" once per matched file, so a new test
+                # file needs no flake edit. failglob makes an empty glob a
+                # shell error, so the || guard fires even without `set -e';
+                # otherwise the check would silently pass with zero tests.
+                # The unquoted $test_args is intentional: the words must split
+                # into -l <file> pairs, safe because test names hold no spaces.
+                shopt -s failglob
+                test_args=$(printf -- "-l %s " test/*-test.el) || {
+                  echo 'no tests matched test/*-test.el' >&2
+                  exit 1
+                }
+                shopt -u failglob
+                emacs --batch -L . $test_args \
                   -f ert-run-tests-batch-and-exit
                 runHook postCheck
               '';
@@ -121,7 +135,7 @@
 
             devShells.default = pkgs.mkShell {
               # A real Emacs for interactive testing of the package under
-              # development: nix develop && emacs -L . -l derivation-tests.el
+              # development: nix develop && emacs -L . -l test/derivation-test.el
               packages = [ pkgs.emacs ];
             };
           };

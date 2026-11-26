@@ -10,7 +10,7 @@ newer, for `replace-region-contents`. License: AGPL-3.0-or-later.
 ## Layout
 
 - `derivation.el` — single-file library, about 400 lines.
-- `derivation-tests.el` — ERT suite, 98 tests.
+- `test/derivation-test.el` — ERT suite, 98 tests, one file per source unit.
 - `flake.nix` — flake for non-interactive batch testing. `nix build` runs the
   ERT suite and the formatting check. The devShell provides Emacs.
 - `flake.lock` — pinned inputs.
@@ -21,7 +21,7 @@ newer, for `replace-region-contents`. License: AGPL-3.0-or-later.
 - `nix flake check` — the same checks.
 - `nix develop` — dev shell with a real Emacs.
 - `nix fmt` — treefmt.
-- `emacs --batch -L . -l derivation-tests.el -f
+- `emacs --batch -L . -l test/derivation-test.el -f
   ert-run-tests-batch-and-exit` — run the suite directly.
 
 Do not hand-edit the version. The flake derives `0-unstable-YYYY-MM-DD` from

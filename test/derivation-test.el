@@ -1,4 +1,4 @@
-;;; derivation-tests.el --- Tests for derivation.el -*- lexical-binding: t -*-
+;;; derivation-test.el --- Tests for derivation.el -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2026  Daniel Nagy
 
@@ -1757,5 +1757,5 @@ the in-place change and triggers recomputation regardless."
       (when process
         (derivation-test--process-cleanup process)))))
 
-(provide 'derivation-tests)
-;;; derivation-tests.el ends here
+(provide 'derivation-test)
+;;; derivation-test.el ends here
